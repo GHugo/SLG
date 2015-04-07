@@ -378,6 +378,22 @@ void init_parameters() {
 
    /* Initialisation du générateur aléatoire*/
    srand (0);
+
+#elif SPECWEB09_BANKING_WORKLOAD
+   // Sanity check that all lines probabilities are equals to one
+   int i = 0;
+   int j = 0;
+   float sum = 0.f;
+
+   for (i = 0; i < SPECWEB09_BANKING_WORKLOAD_PAGE_COUNT; i++) {
+	   sum = 0.f;
+
+	   for (j = 0; j < SPECWEB09_BANKING_WORKLOAD_PAGE_COUNT; j++)
+		   sum += page_transitions[i][j];
+
+	   if (fabs(sum - 1.f) > 0.00001)
+		   PANIC("Sum of probabilities (%f) for page %d of SpecWeb09 Banking workload is not equal to 1\n", sum, i);
+   }
 #endif
 }
 
@@ -890,8 +906,23 @@ char * choose_url(__attribute__((unused)) client_t* client) {
       snprintf(url,url_size,"/support/downloads/dir%010d/download%d_%d",dir,class,file);
    }
 
+#elif SPECWEB09_BANKING_WORKLOAD
+   double d = (double) rand () / ((double)RAND_MAX+1.);
+   float sum = page_transitions[client->current_url][0];
+   int url_size = 128;
 
+   int i = 1;
 
+   while (i < SPECWEB09_BANKING_WORKLOAD_PAGE_COUNT && sum <= d)
+	   sum += page_transitions[client->current_url][i++];
+
+   if (i == SPECWEB09_BANKING_WORKLOAD_PAGE_COUNT && sum <= d)
+	   PANIC("Seeking URL for SpecWeb09 banking and goes out. Check probabilities -- or algorithm\n");
+
+   url = calloc(url_size, sizeof(char));
+   strncpy(url, page_mapping[i - 1], url_size - 1);
+   url[url_size - 1] = '\0';
+   client->current_url = i - 1;
 
 #elif UNIQUE_FILE_ACCESS_PATTERN
    /* Use always the same url */
@@ -2077,6 +2108,8 @@ int main(int argc, char** argv) {
    fprintf(stderr,"target file: %s\n", "SpecWeb99");
 #elif SPECWEB05_FILE_ACCESS_PATTERN
    fprintf(stderr,"target file: %s\n", "SpecWeb05");
+#elif SPECWEB09_BANKING_WORKLOAD
+   fprintf(stderr,"target file: %s\n", "SpecWeb09 Banking Workload");
 #elif UNIQUE_FILE_ACCESS_PATTERN
    fprintf(stderr,"target file: %s\n", file);
 #else

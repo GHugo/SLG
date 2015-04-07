@@ -945,6 +945,8 @@ void print_parameter_summary(FILE* output) {
    fprintf(output, "\t- Using SpecWeb99 distribution\n");
 #elif SPECWEB05_FILE_ACCESS_PATTERN
    fprintf(output, "\t- Using SpecWeb05 distribution\n");
+#elif SPECWEB09_BANKING_WORKLOAD
+   fprintf(output, "\t- Using SpecWeb09 Banking Workload distribution\n");
 #else
    PRINT_ALERT("Unknown access file protocol\n");
    exit(EXIT_FAILURE);

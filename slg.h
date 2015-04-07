@@ -145,6 +145,10 @@ typedef struct {
 	char is_unix;
 
 	int current_target;
+
+#ifdef SPECWEB09_BANKING_WORKLOAD
+	int current_url;
+#endif
 } client_t;
 
 #define SET_IF_MIN(min, val) if(val<min){min = val;}

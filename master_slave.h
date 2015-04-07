@@ -25,6 +25,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 #define UNIQUE_FILE_ACCESS_PATTERN      1
 #define SPECWEB99_FILE_ACCESS_PATTERN   0
 #define SPECWEB05_FILE_ACCESS_PATTERN   0
+#define SPECWEB09_BANKING_WORKLOAD      0
 
 // Other protocol
 #define CLOSE_AFTER_REQUEST             0
@@ -126,6 +127,66 @@ const double type_freq[] = {
          0.99,
          1
 };
+
+#elif SPECWEB09_BANKING_WORKLOAD
+/** Based on
+	https://www.spec.org/web2009/docs/pseudocode/banking_scripts_pseudocode.html
+	And https://www.spec.org/web2009/docs/design/BankingDesign.html **/
+
+#define SPECWEB09_BANKING_WORKLOAD_PAGE_COUNT 17
+
+// Mapping ID => PHP page
+// Note: don't support multiple pages per ID
+const char * page_mapping[SPECWEB09_BANKING_WORKLOAD_PAGE_COUNT] = {
+	"/bank/login.php",
+	"/bank/account_summary.php",
+	"/bank/check_detail_html.php?check_no=6",
+	"/bank/bill_pay.php?userid=39",
+	"/bank/add_payee.php?userid=0000000079",
+	"/bank/post_payee.php",
+	"/bank/quick_pay.php",
+	"/bank/bill_pay_status_output.php?userid=39&start=2005-01-9&end=2005-02-09",
+	"/bank/profile.php?userid=90",
+	"/bank/change_profile.php",
+	"/bank/order_check.php?userid=76",
+	"/bank/place_check_order.php",
+	"/bank/transfer.php",
+	"/bank/post_transfer.php",
+	"/bank/logout.php?userid=6",
+	"/bank/check_detail_image.php?side=front&check_no=6",
+	"/bank/check_detail_image.php?side=back&check_no=6",
+};
+
+// Markov table for transitions between dynamic pages
+
+/** The probabilities on most rows (except from states 2, 14, and 16) add up to
+ * 0.8. This is because there is a 20% probability associated with the user
+ * leaving the system from any state. States 15 and 16 are not real states, they
+ * are part of state 2 and were created to ease implementation.
+ * ==>
+ * 20% of probability to fetch login.php again
+ */
+const float page_transitions[SPECWEB09_BANKING_WORKLOAD_PAGE_COUNT][SPECWEB09_BANKING_WORKLOAD_PAGE_COUNT] = {
+	// 0     1     2     3     4     5     6     7     8     9    10    11    12    13    14    15    16
+	{0.20, 0.32, 0.  , 0.32, 0.  , 0.  , 0.  , 0.  , 0.  , 0.  , 0.  , 0.  , 0.08, 0.  , 0.08, 0.  , 0.  },
+	{0.20, 0.  , 0.56, 0.  , 0.  , 0.  , 0.  , 0.  , 0.08, 0.  , 0.08, 0.  , 0.  , 0.  , 0.08, 0.  , 0.  },
+	{0.  , 0.  , 0.  , 0.  , 0.  , 0.  , 0.  , 0.  , 0.  , 0.  , 0.  , 0.  , 0.  , 0.  , 0.  , 1.00, 0.  },
+	{0.20, 0.  , 0.  , 0.  , 0.08, 0.  , 0.48, 0.16, 0.  , 0.  , 0.  , 0.  , 0.  , 0.  , 0.08, 0.  , 0.  },
+	{0.20, 0.  , 0.  , 0.  , 0.  , 0.72, 0.  , 0.  , 0.  , 0.  , 0.  , 0.  , 0.  , 0.  , 0.08, 0.  , 0.  },
+	{0.20, 0.  , 0.  , 0.72, 0.  , 0.  , 0.  , 0.  , 0.  , 0.  , 0.  , 0.  , 0.  , 0.  , 0.08, 0.  , 0.  },
+	{0.20, 0.  , 0.  , 0.72, 0.  , 0.  , 0.  , 0.  , 0.  , 0.  , 0.  , 0.  , 0.  , 0.  , 0.08, 0.  , 0.  },
+	{0.20, 0.  , 0.  , 0.72, 0.  , 0.  , 0.  , 0.  , 0.  , 0.  , 0.  , 0.  , 0.  , 0.  , 0.08, 0.  , 0.  },
+	{0.20, 0.  , 0.  , 0.  , 0.  , 0.  , 0.  , 0.  , 0.  , 0.72, 0.  , 0.  , 0.  , 0.  , 0.08, 0.  , 0.  },
+	{0.20, 0.72, 0.  , 0.  , 0.  , 0.  , 0.  , 0.  , 0.  , 0.  , 0.  , 0.  , 0.  , 0.  , 0.08, 0.  , 0.  },
+	{0.20, 0.  , 0.  , 0.  , 0.  , 0.  , 0.  , 0.  , 0.  , 0.  , 0.  , 0.72, 0.  , 0.  , 0.08, 0.  , 0.  },
+	{0.20, 0.72, 0.  , 0.  , 0.  , 0.  , 0.  , 0.  , 0.  , 0.  , 0.  , 0.  , 0.  , 0.  , 0.08, 0.  , 0.  },
+	{0.20, 0.  , 0.  , 0.  , 0.  , 0.  , 0.  , 0.  , 0.  , 0.  , 0.  , 0.  , 0.  , 0.72, 0.08, 0.  , 0.  },
+	{0.20, 0.72, 0.  , 0.  , 0.  , 0.  , 0.  , 0.  , 0.  , 0.  , 0.  , 0.  , 0.  , 0.  , 0.08, 0.  , 0.  },
+	{1.00, 0.  , 0.  , 0.  , 0.  , 0.  , 0.  , 0.  , 0.  , 0.  , 0.  , 0.  , 0.  , 0.  , 0.  , 0.  , 0.  },
+	{0.  , 0.  , 0.  , 0.  , 0.  , 0.  , 0.  , 0.  , 0.  , 0.  , 0.  , 0.  , 0.  , 0.  , 0.  , 0.  , 1.00},
+	{0.20, 0.72, 0.  , 0.  , 0.  , 0.  , 0.  , 0.  , 0.  , 0.  , 0.  , 0.  , 0.  , 0.  , 0.08, 0.  , 0.  },
+};
+
 #endif
 
 /** Internal for communication **/
@@ -135,7 +196,7 @@ const double type_freq[] = {
 // Response max size
 #define RESPONSE_SIZE	                        1024
 
-#if UNIQUE_FILE_ACCESS_PATTERN + SPECWEB99_FILE_ACCESS_PATTERN + SPECWEB05_FILE_ACCESS_PATTERN != 1
+#if UNIQUE_FILE_ACCESS_PATTERN + SPECWEB99_FILE_ACCESS_PATTERN + SPECWEB05_FILE_ACCESS_PATTERN + SPECWEB09_BANKING_WORKLOAD!= 1
 #error 'You must choose a (unique) file workload'
 #endif
 
