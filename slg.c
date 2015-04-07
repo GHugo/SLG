@@ -38,6 +38,9 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 #include <sys/socket.h>
 #include <sys/time.h>
 
+#include <sys/un.h>
+#define UNIX_PATH_MAX    108
+
 #include <arpa/inet.h>
 #include <netdb.h>
 
@@ -104,7 +107,7 @@ unsigned int port;
 unsigned int nb_clients;
 unsigned int nb_msg_per_connection;
 unsigned long long duration;
-
+char is_unix;
 unsigned int delay;
 
 /** All the clients will be save in a table pointed by this pointer */
@@ -331,6 +334,7 @@ void init_parameters() {
    /* Default values for client configuration */
    host = "localhost";
    port = 8080;
+   is_unix = 0;
    nb_clients = 0;
    duration = 0;
    nb_msg_per_connection = 0;
@@ -383,28 +387,40 @@ void init_parameters() {
 void init_server_target(client_t* client, char *hostname, int port) {
    struct in_addr *ip_addr;
 
-   //Init remote server struct
-   if (hostname) {
-      client->ent = gethostbyname(hostname);
-      if (client->ent == NULL) {
-         PANIC("lookup on server's name \"%s\" failed\n", hostname);
-      }
-      ip_addr = (struct in_addr *)(*(client->ent->h_addr_list));
-      client->soc_address.sin_family = AF_INET;
-      bcopy(ip_addr, &(client->soc_address.sin_addr), sizeof(struct in_addr));
-   }
+   // Unix socket
+   if (port == 0) {
+	   client->is_unix = 1;
+	   memset(&client->soc_unx, 0, sizeof(struct sockaddr_un));
+	   client->soc_unx.sun_family = AF_UNIX;
+	   strncpy(client->soc_unx.sun_path, hostname, UNIX_PATH_MAX - 1);
+	   client->soc_unx.sun_path[UNIX_PATH_MAX - 1] = '\0';
+   } else {
+	   client->is_unix = 0;
+	   memset(&client->soc_tcp, 0, sizeof(struct sockaddr_in));
 
-   if (!client->ent) {
-      if (hostname){
-         PANIC("error - didn't get host info for %s\n", hostname);
-      }
-      else{
-         PANIC("error - never called gethostbyname\n");
-      }
-   }
+	   //Init remote server struct
+	   if (hostname) {
+		   client->ent = gethostbyname(hostname);
+		   if (client->ent == NULL) {
+			   PANIC("lookup on server's name \"%s\" failed\n", hostname);
+		   }
+		   ip_addr = (struct in_addr *)(*(client->ent->h_addr_list));
+		   client->soc_tcp.sin_family = AF_INET;
+		   bcopy(ip_addr, &(client->soc_tcp.sin_addr), sizeof(struct in_addr));
+	   }
 
-   if (port)
-      client->soc_address.sin_port = htons(port);
+	   if (!client->ent) {
+		   if (hostname){
+			   PANIC("error - didn't get host info for %s\n", hostname);
+		   }
+		   else{
+			   PANIC("error - never called gethostbyname\n");
+		   }
+	   }
+
+	   if (port)
+		   client->soc_tcp.sin_port = htons(port);
+   }
 
 }
 
@@ -573,7 +589,10 @@ void init_client_socket(client_t* client) {
 
 
    //Getting Socket
-   client->fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+   if (client->is_unix)
+	   client->fd = socket(AF_UNIX, SOCK_STREAM, 0);
+   else
+	   client->fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
 
 
    if (client->fd == -1) {
@@ -655,7 +674,8 @@ states_t initialize_connect_client_to_server(client_t* client) {
       DEBUG("client %d first time try to connect at %s\n",
                client->number,getCurrentTime());
    }
-   int status = connect(client->fd, (struct sockaddr *)&client->soc_address, sizeof(client->soc_address));
+
+   int status = connect(client->fd, (struct sockaddr *)&(client->soc_address), client->is_unix ? sizeof(struct sockaddr_un) : sizeof(struct sockaddr_in));
 
    int err= errno;
    if ((status == -1) && (err != EINPROGRESS && err != EADDRNOTAVAIL && err != ECONNABORTED)) {
@@ -677,7 +697,9 @@ states_t initialize_connect_client_to_server(client_t* client) {
    }
 
    if(status == 0){
-      assert(0 && "Connect return 0 immediately ? (Should not happen but if so, we must add a finalize_client_connect.)");
+      if (client->is_unix == 0)
+	     assert(0 && "Connect return 0 immediately ? (Should not happen but if so, we must add a finalize_client_connect.)");
+
       // Connect OK
       add_client_to_master_write_set(client);
 
@@ -876,7 +898,7 @@ char * choose_url(__attribute__((unused)) client_t* client) {
    url = file;
 #endif
 
-   DEBUG("[Client %d] URL : %s\n",url, client_no);
+   DEBUG("[Client %d] URL : %s\n", client->number, url);
    return url;
 }
 
@@ -895,7 +917,7 @@ void build_http_request(client_t* client) {
             "Accept: text/plain,text/html,*/*\r\n\r\n",
             url,
             //client->number, client->req_unique_id,my_hostname,
-            host);
+            client->is_unix ? "localhost" : host);
 
 #if !UNIQUE_FILE_ACCESS_PATTERN
    free(url);
@@ -1431,7 +1453,7 @@ void check_parameters() {
    if (nb_clients>MAX_CLIENTS) {
       PANIC("The number of clients must be between %d and %d\n", 1 , MAX_CLIENTS);
    }
-   if (port == 0) {
+   if (port == 0 && is_unix == 0) {
       PANIC("Distant server port must be between %d and %d\n", 1 , 65535);
    }
    if (duration == 0) {
@@ -1502,9 +1524,9 @@ void print_stats() {
    DEBUG("All next presented times are in microseconds(us).\n");
 
    DEBUG("Global bytes received: %llu bytes.\n", global_total_bytes_recv);
-   DEBUG("Global response received: %lu bytes/sec.\n", global_total_resp_recv);
+   DEBUG("Global response received: %llu bytes/sec.\n", global_total_resp_recv);
 
-   DEBUG("global_avgCT:%.4f, global_avgRT:%.4f, global_avgCRT:%.4Lf, global_minCT:%lu, global_maxCT:%lu\n\n",
+   DEBUG("global_avgCT:%.4Lf, global_avgRT:%.4Lf, global_avgCRT:%.4Lf, global_minCT:%lu, global_maxCT:%lu\n\n",
             global_avgCT,
             global_avgRT,
             global_avgCRT,
@@ -1979,6 +2001,7 @@ int waitMasterOrder(int masterOrderSocket, char* req) {
 
    token = strtok(NULL, delimiters);
    port = atoi(token);
+   is_unix = host[0] == '/' && port == 0;
 
    token = strtok(NULL, delimiters);
    nb_clients = atoi(token);
@@ -2086,7 +2109,7 @@ int main(int argc, char** argv) {
    while (1) {//deamon loop
 
       DEBUG("---------------------------------------------------------------\n");
-      DEBUG("Waiting master orders (nb orders done: %d).\n", num_global_iteration);
+      DEBUG("Waiting master orders.\n");
 
       //Accept master connection
       masterOrderSocket = waitMasterConnection();

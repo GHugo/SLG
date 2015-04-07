@@ -136,7 +136,13 @@ typedef struct {
 
 	/** Target server for all clients */
 	struct hostent *ent;
-	struct sockaddr_in soc_address;
+	union {
+		struct sockaddr soc_address;
+		struct sockaddr_in soc_tcp;
+		struct sockaddr_un soc_unx;
+	};
+
+	char is_unix;
 
 	int current_target;
 } client_t;

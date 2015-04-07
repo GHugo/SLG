@@ -188,7 +188,7 @@ void print_help_message() {
    printf("-------------------------SLG_MASTER HELP MESSAGE-------------------------\n");
    printf("parameters:\n");
    printf("\t--param (-p): description\n");
-   printf("\t--targets (-t): list of target for each slave. (ip:port,ip:port)\n");
+   printf("\t--targets (-t): list of target for each slave. ([ip:port|unix:/absolute_path],[ip:port|unix:/absolute_path])\n");
    printf("\t--slaves (-S): list of slaves. (slave:port,slave:port)\n");
    printf("\t--nb_iterations (-i): the number of iteration to do in a wave\n");
    printf("\t--nb_clients_min (-m): each slave starts with this number of clients\n");
@@ -599,17 +599,26 @@ int init_slaves_info(char *slavesInfos, char * targets) {
    for (i = 0; i<nb_targets; i++) {
       char * port = strchr(token, ':');
       if (port == NULL) {
-         printf("Bad targets address format\n");
-         exit(0);
+            printf("Bad targets address format\n");
+            exit(0);
       }
-      *port = 0;
-      port += sizeof(char);
 
-      //Put target host
-      strcpy(slaves_infos[i].target, token);
+      if (strncmp("unix:", token, 5 /* strlen(unix:) */) == 0) {
+          // Format: unix:path
+          strcpy(slaves_infos[i].target, port + sizeof(char));
+          slaves_infos[i].target_port = 0;
+      } else {
+          // Format: addr:port
+          *port = 0;
+          port += sizeof(char);
 
-      //Get target port
-      slaves_infos[i].target_port = atoi(port);
+          //Put target host
+          strcpy(slaves_infos[i].target, token);
+
+          //Get target port
+          slaves_infos[i].target_port = atoi(port);
+      }
+
 
       /** Search if server already found **/
       int j = 0;
