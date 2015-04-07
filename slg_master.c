@@ -70,6 +70,7 @@ unsigned int nb_clients = 0;
 unsigned int duration = 0;
 unsigned int nb_msg_per_connection = 0;
 unsigned int delay = 0;
+char * fastcgi_base_path;
 
 int percent_stats_kept_master = 100;
 
@@ -81,6 +82,7 @@ int N_copy = 0;
 
 /** Warmup ? **/
 static int warmup_length = 0;
+
 
 slaves_stats_t * slaves_stats = NULL;
 unsigned int nb_clients_min = 0;
@@ -175,6 +177,9 @@ void parse_config_file(char * conf_file) {
       else if (strcmp(param, "warmup") == 0) {
          warmup_length = atoi(value);
       }
+      else if (strcmp(param, "fastcgi_base_path") == 0) {
+         fastcgi_base_path = value;
+      }
       else {
          PANIC("unknown config parameter line %d: %s\n", line_num, param);
       }
@@ -200,6 +205,7 @@ void print_help_message() {
    printf("\t--percent_stats_kept_master* (-p): the percentage number of samples kept on the master\n");
    printf("\t--file* (-f): config file\n");
    printf("\t-r: dump a summary on stderr to know where is the bench when redirecting in a file\n");
+   printf("\t--fastcgi_base_path* (-b): base path for fastcgi request (where fcgi scripts are)\n");
 
    printf("Parameters with a * are optionnal, all  others are mandatory.\n");
    printf("The parameters from the command line overide the ones in the config file .\n");
@@ -250,6 +256,11 @@ void check_all_parameters_filled() {
       PANIC("Unknown value for warmup");
    }
 
+#ifdef FASTCGI_PROTOCOL
+   if (fastcgi_base_path == NULL) {
+      PANIC("fastcgi_base_path not initialized.\n");
+   }
+#endif
    return;
 }
 
@@ -289,10 +300,11 @@ void parse_command_line(int argc, char** argv) {
                { "percent_stats_kept_master", 1, 0, 'P' },
                { "help", 0, 0, 'h' },
                { "file", 1, 0, 'f' },
+               { "fastcgi_base_path", 1, 0, 'b' },
                { 0, 0, 0, 0 }
       };
 
-      c = getopt_long(argc, argv, "i:t:m:M:s:D:n:d:S:f:P:rh",
+      c = getopt_long(argc, argv, "i:t:m:M:s:D:n:d:S:f:P:r:bh",
                long_options, &option_index);
 
       if (c == -1)
@@ -350,6 +362,10 @@ void parse_command_line(int argc, char** argv) {
 
          case 'S':
             slavesInfos = optarg;
+            break;
+
+         case 'b':
+            fastcgi_base_path = optarg;
             break;
 
          default:
@@ -752,16 +768,16 @@ void send_order_to_slaves(slaves_infos_t * slaves, int nb_slaves, int warmup) {
       gethostname(name, 255);
 
       //creating the query string to send to the slaves.
-      //params: slave_number, reportingAddress, host, port, nb_clients, nb_iterations, nb_msg_per_connection, delay, slaves_interval_avg_percent
+      //params: slave_number, reportingAddress, host, port, nb_clients, nb_iterations, nb_msg_per_connection, delay, slaves_interval_avg_percent, fastcgi_base_path
       int _duration = duration;
       if(warmup){
          _duration = warmup_length;
       }
 
-      sprintf(msg, "%d,%s,%s,%d,%d,%d,%d,%d\n",
+      sprintf(msg, "%d,%s,%s,%d,%d,%d,%d,%d,%s\n",
                i, name, slaves[i].target, slaves[i].target_port,
                nb_clients, _duration, nb_msg_per_connection,
-               delay);
+              delay, fastcgi_base_path);
 
       cnt = 0;
       do {
@@ -919,10 +935,12 @@ void print_parameter_summary(FILE* output) {
             "\t- nb msg per connection:%d\n"
             "\t- master percent: %d%%\n"
             "\t- sleep time between two iterations: %d (us)\n"
-            "\t- warmup: %d s\n",
+            "\t- warmup: %d s\n"
+            "\t- fastcgi_base_path: %s\n",
             nb_slaves, nb_iterations_in_a_wave, nb_waves, nb_clients_min,
             nb_clients_max, step, duration,nb_msg_per_connection,
-            percent_stats_kept_master, SLEEP_TIME_BETWEEN_TWO_ITERATIONS, warmup_length);
+            percent_stats_kept_master, SLEEP_TIME_BETWEEN_TWO_ITERATIONS, warmup_length,
+            fastcgi_base_path);
 
 #ifdef USE_RST
    fprintf(output,"\t- Using RST flag for closing connection\n");

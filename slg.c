@@ -20,6 +20,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 #define _GNU_SOURCE
 #include <stdlib.h>
 #include <stdio.h>
+#include <stddef.h>
 #include <netdb.h>
 #include <fcntl.h>
 #include <errno.h>
@@ -142,6 +143,8 @@ circularBuffer * toReadBuffer;
 //wreadrite thread fills it, write thread empties it.
 circularBuffer * toWriteBuffer;
 
+// FastCGI specific
+static char* fastcgi_base_path;
 
 #if UNIQUE_FILE_ACCESS_PATTERN
 static char * file = "/index.html";
@@ -964,6 +967,174 @@ void build_http_request(client_t* client) {
    assert(client->request_total_len < REQUEST_BUFFER_SIZE);
 }
 
+/**
+ * Build a FastCGI request
+ * See http://www.fastcgi.com/devkit/doc/fcgi-spec.html#SB
+ * Note: suppose big endian
+ **/
+void build_fastcgi_request(client_t* client) {
+   char* url = choose_url(client);
+   client->req_unique_id++;
+   size_t size = 0;
+   unsigned int i = 0;
+
+   FCGI_Header header;
+   header.version = FCGI_VERSION_1;
+   header.requestId = htons(1);
+   header.reserved = 0;
+   header.paddingLength = 0; // May be used to byte-align with content
+
+   // {FCGI_BEGIN_REQUEST,   1, {FCGI_RESPONDER, 0}}
+   FCGI_BeginRequestBody begin_request_body;
+   header.type = FCGI_BEGIN_REQUEST;
+   begin_request_body.role = htons(FCGI_RESPONDER);
+   begin_request_body.flags = 0;
+   header.contentLength = htons(sizeof(begin_request_body));
+
+   FCGI_BeginRequestRecord begin_request_record;
+   begin_request_record.header = header;
+   begin_request_record.body = begin_request_body;
+   memcpy(client->request_buf, (char *)&begin_request_record, MIN(REQUEST_BUFFER_SIZE - size, sizeof(begin_request_record)));
+   size += sizeof(begin_request_record);
+   assert(size < REQUEST_BUFFER_SIZE);
+
+   // {FCGI_PARAMS,          1, "\013\002SERVER_PORT80\013\016SERVER_ADDR199.170.183.42 ... "}
+   header.type = FCGI_PARAMS;
+
+   // Keep content length offset to update latter
+   char *content_length_offset = client->request_buf + size + offsetof(FCGI_Header, contentLength);
+
+   // Write the FCGI_PARAMS header
+   memcpy(client->request_buf + size, (char *)&header, MIN(REQUEST_BUFFER_SIZE - size, sizeof(header)));
+   size += sizeof(header);
+   assert(size < REQUEST_BUFFER_SIZE);
+
+   // "Lengths of 127 bytes and less can be encoded in one byte" << TODO
+   size_t before_size = size;
+   size_t url_length = strlen(url);
+
+   char *token = strchr(url, '?');
+   char *fastcgi_absolute_url = NULL;
+   char *script_name = NULL;
+   char *query_string = NULL;
+   size_t base_path_length = strlen(fastcgi_base_path);
+
+   if (token == NULL) {
+	   fastcgi_absolute_url = calloc(base_path_length + url_length + 1, sizeof(char));
+	   assert(fastcgi_absolute_url != NULL);
+	   strcpy(fastcgi_absolute_url, fastcgi_base_path);
+	   strcat(fastcgi_absolute_url, url);
+	   script_name = url;
+	   query_string = NULL;
+   } else {
+	   fastcgi_absolute_url = calloc(base_path_length + (token - url) + 1, sizeof(char));
+	   strcpy(fastcgi_absolute_url, fastcgi_base_path);
+	   strncat(fastcgi_absolute_url, url, token - url);
+
+	   script_name = calloc(token - url, sizeof(char));
+	   strcpy(script_name, url);
+
+	   query_string = calloc(url_length - (url - token - 1) + 1, sizeof(char));
+	   strcat(query_string, (char *)(url - token + 1));
+   }
+
+   const char *params[] = {
+	   "SCRIPT_FILENAME", fastcgi_absolute_url,
+	   "QUERY_STRING", query_string,
+	   "REQUEST_METHOD", "GET",
+	   "CONTENT_TYPE", "",
+	   "CONTENT_LENGTH", "",
+	   "SCRIPT_NAME", script_name,
+	   "REQUEST_URI", url,
+	   "DOCUMENT_ROOT", fastcgi_base_path,
+	   "SERVER_PROTOCOL", "HTTP/1.1",
+	   "GATEWAY_INTERFACE", "CGI/1.1",
+	   "SERVER_SOFTWARE", "slg",
+	   "REMOTE_ADDR", "127.0.0.1",
+	   "REMOTE_PORT", "12345",
+	   "SERVER_ADDR", client->is_unix ? "127.0.0.1" : client->ent->h_addr,
+	   "SERVER_PORT", "80",
+	   "SERVER_NAME", "localhost",
+	   "REDIRECT_STATUS", "200",
+	   "HTTP_HOST", client->is_unix ? "localhost" : client->ent->h_addr,
+	   "HTTP_USER_AGENT", "slg",
+	   "HTTP_ACCEPT", "text/plain,text/html,*/*"
+   };
+
+   for (i = 0; i < sizeof(params)/sizeof(char*); i += 2) {
+	   /**
+		  typedef struct {
+		  uint32_t nameLength;
+		  uint32_t valueLength;
+		  uint8_t name[nameLength];
+		  uint8_t value[valueLength];
+		  } FCGI_NameValuePair;
+	   */
+
+	   const char* name = params[i];
+	   const char* value = params[i + 1];
+
+	   uint32_t nameLength = name ? strlen(name) : 0;
+	   uint32_t valueLength = value ? strlen(value) : 0;
+
+	   /**
+		* The high-order bit of the first byte of a length indicates the
+		* length's encoding. A high-order zero implies a one-byte encoding, a
+		* one a four-byte encoding. */
+	   uint32_t nameLengthBigEndian = htonl(nameLength  | (uint32_t)(1 << 31));
+	   uint32_t valueLengthBigEndian = htonl(valueLength  | (uint32_t)(1 << 31));
+
+	   memcpy(client->request_buf + size, &nameLengthBigEndian, MIN(REQUEST_BUFFER_SIZE - size, sizeof(nameLength)));
+	   size += sizeof(nameLength);
+
+	   memcpy(client->request_buf + size, &valueLengthBigEndian, MIN(REQUEST_BUFFER_SIZE - size, sizeof(valueLength)));
+	   size += sizeof(valueLength);
+
+	   if (nameLength > 0) {
+		   memcpy(client->request_buf + size, name, MIN(REQUEST_BUFFER_SIZE - size, nameLength));
+		   size += nameLength;
+	   }
+
+	   if (valueLength > 0) {
+		   memcpy(client->request_buf + size, value, MIN(REQUEST_BUFFER_SIZE - size, valueLength));
+		   size += valueLength;
+	   }
+
+	   assert(size < REQUEST_BUFFER_SIZE);
+   }
+
+   // Update the contentLength size
+   *(uint16_t*)(content_length_offset) = htons(size - before_size);
+
+   // {FCGI_PARAMS,          1, ""}
+   header.contentLength = 0;
+   memcpy(client->request_buf + size, &header, MIN(REQUEST_BUFFER_SIZE - size, sizeof(header)));
+   size += sizeof(header);
+   assert(size < REQUEST_BUFFER_SIZE);
+
+   // {FCGI_STDIN,           1, ""}
+   header.type = FCGI_STDIN;
+   memcpy(client->request_buf + size, &header, MIN(REQUEST_BUFFER_SIZE - size, sizeof(header)));
+   size += sizeof(header);
+   assert(size < REQUEST_BUFFER_SIZE);
+
+   free(fastcgi_absolute_url);
+   if (token != NULL)
+	   free(script_name);
+   if (query_string != NULL)
+	   free(query_string);
+#if !UNIQUE_FILE_ACCESS_PATTERN
+   free(url);
+#endif
+
+   DEBUG("Client %d will send : %s", client->number, client->request_buf);
+
+
+   /* We accept all type of response */
+   client->request_total_len = size;
+   assert(client->request_total_len < REQUEST_BUFFER_SIZE);
+}
+
 #define MIX_GET_SET     10 // X% of set ops
 #define VALUE_SIZE      450 // Be careful with REQUEST_BUFFER_SIZE
 #define HOW_MANY_KEYS   10000
@@ -1280,7 +1451,21 @@ static void read_headers(client_t *client){
       PANIC("Cannot find headers. MAX_HDR_LENGTH is probably to small\n");
    }
 #else
-   char * headers_end = strstr(client->read_hdr_buf, "\r\n\r\n");
+
+   size_t padding = 0;
+
+#if FASTCGI_PROTOCOL
+   padding = sizeof(FCGI_Header);
+
+   if (strncmp(client->read_hdr_buf + padding, "Primary script unknown", 22) == 0) {
+	   PRINT_ALERT("****** WARNING - Get an unwanted header response ******\n");
+	   PRINT_ALERT("Header: %s\n",   client->read_hdr_buf + padding);
+	   treat_error(client);
+	   return;
+   }
+#endif
+   char * headers_end = strstr(client->read_hdr_buf + padding, "\r\n\r\n");
+
    if (headers_end != NULL) {
       // Firsty check if the response is not 404
       /*
@@ -1289,28 +1474,30 @@ static void read_headers(client_t *client){
       }
       */
       //if (strcasestr(client->read_hdr_buf, "200 OK") == NULL && strcasestr(client->read_hdr_buf, "404 Not Found") == NULL ) {
+#if !FASTCGI_PROTOCOL
 	   if (strcasestr(client->read_hdr_buf, "200 OK") == NULL) {
          PRINT_ALERT("****** WARNING - Get an unwanted header response ******\n");
-         PRINT_ALERT("Header: %s\n",   client->read_hdr_buf);
+         PRINT_ALERT("Header: %s\n",   client->read_hdr_buf + padding);
          treat_error(client);
          return;
       }
+#endif
 
-      client->header_length = headers_end - client->read_hdr_buf + 4;
+      client->header_length = headers_end - client->read_hdr_buf + 4 + padding;
       DEBUG("Header length : %d\n",client->header_length);
-      DEBUG("Hdr : \n%s\n", client->read_hdr_buf);
+      DEBUG("Hdr : \n%s\n", client->read_hdr_buf + padding);
 
       // Now parse the headers
-      char * cl = strstr(client->read_hdr_buf, "Content-Length:");
+      char * cl = strstr(client->read_hdr_buf + padding, "Content-Length:");
 
       if(!cl){
          PRINT_ALERT("%s", client->read_hdr_buf);
          PANIC("Warning content length must be specified in server response\n");
       }
 
-      client->content_length = atoi(cl+15);
+	  client->content_length = atoi(cl+15);
 
-      DEBUG("Content length : %d\n",client->content_length);
+      DEBUG("Content length : %u\n", client->content_length);
 
       /** Allocating buffer for file **/
 #if IGNORE_HTTP_CONTENT
@@ -1398,10 +1585,14 @@ static inline void read_content(client_t *client){
       }
    }
    else if (status == 0) {
+#if !IGNORE_HTTP_CONTENT
       //EOF
       PANIC("Get EOF\n");
 
       treat_error(client);
+#else
+	  read_complete(client);
+#endif
       return;
    }
 
@@ -1493,6 +1684,11 @@ void check_parameters() {
    if (nb_msg_per_connection == 0) {
       PANIC("nb_msg_per_connection must be greater/equal than/to %d\n", 1);
    }
+#ifdef FASTCGI_PROTOCOL
+   if (fastcgi_base_path == NULL) {
+	   PANIC("fastcgi_base_path missing but SLG compiled with FASTCGI_PROTOCOL\n");
+   }
+#endif
 }
 
 /**
@@ -2014,7 +2210,7 @@ int waitMasterOrder(int masterOrderSocket, char* req) {
 
    DEBUG("Received data: %s\n", buffer);
 
-   //format: slave_num, reportingAddress, host, port, nb_clients, duration, nb_msg_per_connection, delay
+   //format: slave_num, reportingAddress, host, port, nb_clients, duration, nb_msg_per_connection, delay, fastcgi_base_path
 
    const char delimiters[] = ",";
    char *token;
@@ -2046,8 +2242,11 @@ int waitMasterOrder(int masterOrderSocket, char* req) {
    token = strtok(NULL, delimiters);
    delay = atoi(token);
 
-   DEBUG( "Parameters: slave_num: %d, reportingAddress: %s, host:%s, port:%d, nb_clients:%d, duration:%llu, nb_msg_per_connection:%d, delay:%d\n",
-            slave_num, reportingAddress, host, port, nb_clients, duration, nb_msg_per_connection, delay);
+   token = strtok(NULL, delimiters);
+   fastcgi_base_path = token;
+
+   DEBUG( "Parameters: slave_num: %d, reportingAddress: %s, host:%s, port:%d, nb_clients:%d, duration:%llu, nb_msg_per_connection:%d, delay:%d, fastcgi_base_path:%s\n",
+		  slave_num, reportingAddress, host, port, nb_clients, duration, nb_msg_per_connection, delay, fastcgi_base_path);
    
    return 1;
 

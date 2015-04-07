@@ -40,8 +40,14 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 #elif MEMCACHED_PROTOCOL
 #define BUILD_REQUEST build_memcached_request
 
+#elif FASTCGI_PROTOCOL
+#define BUILD_REQUEST build_fastcgi_request
+#define IGNORE_HTTP_CONTENT 1
+
+#include "fastcgi.h"
+
 #else
-#error You must specify either -DHTTP_PROTOCOL or -DMEMCACHED_PROTOCOL
+#error You must specify either -DHTTP_PROTOCOL or -DMEMCACHED_PROTOCOL or -DFASTCGI_PROTOCOL
 #endif
 
 /**** Socket options ****/
@@ -67,9 +73,12 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 #define REQUEST_BUFFER_SIZE (2048)
 #elif SPECWEB05_FILE_ACCESS_PATTERN
 #define REQUEST_BUFFER_SIZE (1024)
+#elif FASTCGI_PROTOCOL
+#define REQUEST_BUFFER_SIZE (1024)
 #else
 #define REQUEST_BUFFER_SIZE (512)
 #endif
+
 
 /*Nb attempt of connection failed before considering server unreachable*/
 #define NB_CONNECT_ATTEMPTS_MAX 1
@@ -153,4 +162,5 @@ typedef struct {
 
 #define SET_IF_MIN(min, val) if(val<min){min = val;}
 #define SET_IF_MAX(max, val) if(val>max){max = val;}
+#define MIN(a, b) ((a) < (b) ? (a) : (b))
 #endif /*SLG_H_*/

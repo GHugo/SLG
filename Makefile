@@ -6,6 +6,7 @@ CFLAGS = -W -Wall -Werror -O2 -g
 SLG_FLAGS = -DHTTP_PROTOCOL -DUSE_RST
 #SLG_FLAGS = -DHTTP_PROTOCOL -DUSE_RST
 #SLG_FLAGS = -DMEMCACHED_PROTOCOL -DUSE_RST
+#SLG_FLAGS = -DFASTCGI_PROTOCOL -DUSE_RST
 #-DUSE_RST
 #-DHTTP_PROTOCOL
 #-DMEMCACHED_PROTOCOL
@@ -21,7 +22,7 @@ all: ${APPS}
 CC = gcc
 
 # Build libraries
-%.o : %.c %.h master_slave.h debug_tools.h
+%.o : %.c %.h master_slave.h debug_tools.h fastcgi.h
 	${CC} $(CFLAGS) $(SLG_FLAGS) $(DEBUG_FLAGS) $(INCFLAGS) -c $<
 
 # Binaries
