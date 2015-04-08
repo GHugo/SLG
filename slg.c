@@ -967,6 +967,8 @@ void build_http_request(client_t* client) {
    assert(client->request_total_len < REQUEST_BUFFER_SIZE);
 }
 
+#if FASTCGI_PROTOCOL
+
 /**
  * Build a FastCGI request
  * See http://www.fastcgi.com/devkit/doc/fcgi-spec.html#SB
@@ -1134,6 +1136,7 @@ void build_fastcgi_request(client_t* client) {
    client->request_total_len = size;
    assert(client->request_total_len < REQUEST_BUFFER_SIZE);
 }
+#endif
 
 #define MIX_GET_SET     10 // X% of set ops
 #define VALUE_SIZE      450 // Be careful with REQUEST_BUFFER_SIZE
