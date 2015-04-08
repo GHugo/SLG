@@ -88,12 +88,12 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 /**** Clients structs ****/
 /* Possible states for a client */
 typedef enum states_t {
-	ST_WAITING, ST_READING, ST_WRITING, ST_CONNECT
+	ST_WAITING, ST_READING, ST_WRITING, ST_CONNECT, ST_ENDED
 } states_t;
 
 
 /* Structure representing a client */
-typedef struct {
+typedef struct client_t {
 	int number;
 	// Socket used by the client
 	int fd;
@@ -154,6 +154,13 @@ typedef struct {
 	char is_unix;
 
 	int current_target;
+
+	// Client list as linked list
+	struct client_t *next;
+
+	// Current status regarding reader/writer thread
+	int internalReadStatus;
+	int internalWriteStatus;
 
 #ifdef SPECWEB09_BANKING_WORKLOAD
 	int current_url;

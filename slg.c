@@ -48,7 +48,6 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 #include <signal.h>
 
 #include <time.h>
-
 // Include the header
 #include "slg.h"
 #define DO_NOTHING 0
@@ -111,8 +110,16 @@ unsigned long long duration;
 char is_unix;
 unsigned int delay;
 
-/** All the clients will be save in a table pointed by this pointer */
+/** open-loop parameters **/
+#define OPEN_CLIENT_COUNT_STARTUP 10
+char open_active;
+double open_mean;
+double open_var;
+
+/** All the clients will be save in a linked list starting by this pointer
+    Also available in closed-loop as an array*/
 client_t *all_clients;
+unsigned int client_counter;
 
 /** Options for sockets */
 int tcp_no_delay;
@@ -165,6 +172,27 @@ static int num_dirs;
 static uint64_t proc_freq;
 
 static int my_hostname;
+
+// Generate random number using normal distribution N(mean, var)
+// From: http://c-faq.com/lib/gaussian.html
+#define PI 3.141592654
+double gaussrand(double mean, double var)
+{
+	static double U, V;
+	static int phase = 0;
+	double Z;
+
+	if(phase == 0) {
+		U = (rand() + 1.) / (RAND_MAX + 2.);
+		V = rand() / (RAND_MAX + 1.);
+		Z = sqrt(-2 * log(U)) * sin(2 * PI * V);
+	} else
+		Z = sqrt(-2 * log(U)) * cos(2 * PI * V);
+
+	phase = 1 - phase;
+
+	return mean + var * Z;
+}
 
 uint64_t computeCPUhz(){
   uint64_t start,stop,acc;
@@ -343,6 +371,11 @@ void init_parameters() {
    nb_msg_per_connection = 0;
    delay = 0;
 
+   /* Open-loop default values */
+   open_active = 0;
+   open_mean = 0.f;
+   open_var = 0.f;
+
    /* SOCKETS DEFAULT VALUES */
    // if 1 = naggle is disable, if 0 = naggle is enable
    tcp_no_delay = 1;
@@ -462,7 +495,9 @@ void change_state(client_t *client, states_t new_state) {
       case ST_CONNECT:
          DEBUG("ST_CONNECT to ");
          break;
-      default: //ST_ENDED, ST_WAITING
+      // Open open-loop never leave the ST_ENDED state
+      case ST_ENDED:
+      default: //ST_WAITING
          PANIC("%s() l.%d: Should not happen.\n", __FUNCTION__, __LINE__);
    }
 
@@ -495,6 +530,10 @@ void change_state(client_t *client, states_t new_state) {
          DEBUG("ST_WAITING\n");
          //Nothing to do
          break;
+      case ST_ENDED:
+         DEBUG("ST_ENDED\n");
+		 // The reader thread will close the connection
+		 break;
    }
 
 }
@@ -704,14 +743,16 @@ states_t initialize_connect_client_to_server(client_t* client) {
    }
    else if (err == EADDRNOTAVAIL) {
       PRINT_ALERT("No more free local port. Will try later\n");
-      return ST_CONNECT;
+	  // On open-loop set the client to close to avoid spawning too much clients
+      return open_active ? ST_ENDED : ST_CONNECT;
    }
    else if (err == ECONNABORTED) {
       //http://www.wlug.org.nz/ECONNABORTED
       PRINT_ALERT("Client %d get an error for its connect. errno is ECONNABORTED (nb_clients: %d)\n",
                client->number, nb_clients);
 
-      return ST_CONNECT;
+	  // On open-loop set the client to close to avoid spawning too much clients
+      return open_active ? ST_ENDED : ST_CONNECT;
       //exit(EXIT_FAILURE);
    }
 
@@ -773,7 +814,8 @@ states_t finalize_connect_client_to_server(client_t* client) {
       switch (valopt) {
          case ETIMEDOUT:
             DEBUG("client %d connect ETIMEDOUT at %s\n", client->number, getCurrentTime());
-            return ST_CONNECT;
+			// On open-loop set the client to close to avoid spawning too much clients
+			return open_active ? ST_ENDED : ST_CONNECT;
          case ECONNREFUSED:
                client->nb_connect_attempts ++;
                if (client->nb_connect_attempts >= NB_CONNECT_ATTEMPTS_MAX) {
@@ -781,7 +823,8 @@ states_t finalize_connect_client_to_server(client_t* client) {
                }
                PRINT_ALERT("client %d ECONNREFUSED nb_connect_attempts: %d at %s\n", client->number,
                		client->nb_connect_attempts, getCurrentTime());
-               return ST_CONNECT;
+			   // On open-loop set the client to close to avoid spawning too much clients
+			   return open_active ? ST_ENDED : ST_CONNECT;
 
                /** Critical error cases **/
          case EINPROGRESS:
@@ -915,6 +958,10 @@ char * choose_url(__attribute__((unused)) client_t* client) {
    int url_size = 128;
 
    int i = 1;
+
+   if (open_active) {
+	   PANIC("Need to implement Banking Workload for open-loop (compute Markov Steady-State.\n");
+   }
 
    while (i < SPECWEB09_BANKING_WORKLOAD_PAGE_COUNT && sum <= d)
 	   sum += page_transitions[client->current_url][i++];
@@ -1232,9 +1279,15 @@ states_t treat_error(client_t* client) {
    global_avgCRT += (long double) compare_time(&(client->CRTstart), &read_complete_time);
    nb_CRT += client->nbRequestsOnIteration;
 
-   //this connection is ended, let's close it and open another to send burst of requests
-   //DEBUG("Client %d ended its %dth loop. state:%d\n", client->number, client->nbIterations, client->state);
-   change_state(client, ST_CONNECT);
+   if (open_active) {
+	   // Mark this connection as need to be closed (ST_ENDED). The connection will be closed by the reader thread
+	   change_state(client, ST_ENDED);
+   }
+   else {
+	   //this connection is ended, let's close it and open another to send burst of requests
+	   //DEBUG("Client %d ended its %dth loop. state:%d\n", client->number, client->nbIterations, client->state);
+	   change_state(client, ST_CONNECT);
+   }
 
    return client->state;
 }
@@ -1361,9 +1414,17 @@ void read_complete(client_t* client) {
       interfaces_pending[client->current_target]--;
 #endif
 
-      //this connection is ended, let's close it and open another to send burst of requests
-      DEBUG("Client %d ended its iteration\n", client->number);
-      change_state(client, ST_CONNECT);
+	  DEBUG("Client %d ended its iteration\n", client->number);
+
+	  if (open_active) {
+		  // Mark connection as ST_ENDED, will be closed after
+		  change_state(client, ST_ENDED);
+	  }
+	  else {
+		  //this connection is ended, let's close it and open another to send burst of requests
+		  change_state(client, ST_CONNECT);
+	  }
+
    }//end else if
 
 #if !IGNORE_HTTP_CONTENT
@@ -1636,28 +1697,60 @@ states_t read_response(client_t *client) {
 void init_clients() {
 
    unsigned int i;
+   unsigned int total_clients = open_active ? OPEN_CLIENT_COUNT_STARTUP : nb_clients;
+   client_t * client;
+   client_t * open_client_list[OPEN_CLIENT_COUNT_STARTUP];
 
-   all_clients = (client_t*) calloc(nb_clients, sizeof(client_t));
-   assert(all_clients!=NULL);
+   if (!open_active) {
+	   all_clients = (client_t*) calloc(total_clients, sizeof(client_t));
+	   assert(all_clients!=NULL);
+   }
+   else {
+	   for (i = 0; i < OPEN_CLIENT_COUNT_STARTUP; i++) {
+		   open_client_list[i] = (client_t*) calloc(1, sizeof(client_t));
+		   assert(open_client_list[i] != NULL);
+	   }
+	   all_clients = open_client_list[0];
+   }
 
-   for (i=0; i<nb_clients; i++) {
+   client_counter = 0;
 
-      all_clients[i].number = i;
+   for (i=0; i < total_clients; i++) {
 
-      //no valid fd at the beginning
-      all_clients[i].fd = -1;
+	   if (open_active) {
+		   client_counter++;
+		   client = open_client_list[i];
+	   }
+	   else {
+		   client = &all_clients[i];
+	   }
 
-      //initial client state
-      DEBUG("client %d initialized at %s\n", i, getCurrentTime());
-      all_clients[i].state = ST_CONNECT;
+	   client->number = i;
 
-      //after init_client, the client will do a new request
-      all_clients[i].new_request = 1;
+	   //no valid fd at the beginning
+	   client->fd = -1;
+
+	   //initial client state
+	   DEBUG("client %d initialized at %s\n", i, getCurrentTime());
+	   client->state = ST_CONNECT;
+
+	   //after init_client, the client will do a new request
+	   client->new_request = 1;
 
 #if !MULTIPLE_INTERFACES
-      init_server_target(&all_clients[i], host, port);
+	   init_server_target(client, host, port);
 #endif
-
+	   if (i + 1 == total_clients) {
+		   client->next = NULL;
+	   }
+	   else {
+		   if (open_active) {
+			   client->next = open_client_list[i + 1];
+		   }
+		   else {
+			   client->next = &all_clients[i + 1];
+		   }
+	   }
    }
 
    //init stats
@@ -1692,6 +1785,9 @@ void check_parameters() {
 	   PANIC("fastcgi_base_path missing but SLG compiled with FASTCGI_PROTOCOL\n");
    }
 #endif
+   if (open_active && (open_mean <= 0.f || open_var <= 0.f)) {
+	   PANIC("Configured in open-loop but open_mean or open_var is not strictly greater than 0.0\n");
+   }
 }
 
 /**
@@ -1699,7 +1795,6 @@ void check_parameters() {
  * Value are computed only on 80% of the sample.
  */
 void compute_stats() {
-   unsigned long i;
    client_t *client;
 
    //init globale stats:
@@ -1712,25 +1807,23 @@ void compute_stats() {
    global_maxCT = 0;
    global_minCT = (unsigned long) -1;
 
-   for (i=0; i<nb_clients; i++) {
+   client = all_clients;
+   while (client != NULL) {
+	   //Needed for calculating throughput
+	   global_total_bytes_recv += client->total_bytes_recv;
+	   global_total_resp_recv += client->total_resp_recv;
 
-      client = &all_clients[i];
+	   // Compute errors
+	   global_errors += client->errors;
 
-      //Needed for calculating throughput
-      global_total_bytes_recv += client->total_bytes_recv;
-      global_total_resp_recv += client->total_resp_recv;
+	   //Get nb_CRT from unfinished connections.
+	   nb_CRT += (unsigned long long)client->nbRequestsOnIteration;
 
-      // Compute errors
-      global_errors += client->errors;
+	   client = client->next;
    }
 
    global_avgCT = global_avgCT/nb_CT;
 
-   //Get nb_CRT from unfinished connections.
-   for (i=0; i<nb_clients; i++) {
-      client = &all_clients[i];
-      nb_CRT += (unsigned long long)client->nbRequestsOnIteration;
-   }
    global_avgCRT = global_avgCRT/nb_CRT;
 
    global_avgRT = global_avgRT/nb_RT;
@@ -1772,21 +1865,13 @@ void print_stats() {
 static void *writingFunc() {
    DEBUG("writingFunc going...\n");
 
-   unsigned int i;
-   int iClient;
+   int err;
    states_t newClientState;
 
-   //This tab is indiced on the id of the client.
-   //It is used to associate the id of the clients to a local state (DO_NOTHING or DO_WRITE, nothing else).
-   int * internalToWrite = malloc(sizeof(int) * nb_clients);
-
-   if (internalToWrite == NULL) {
-      PANIC("Error allocating internalToWrite table in writingFunc.\n");
-   }
-
-   //init internalToWrite
-   for (i=0; i<nb_clients; i++) {
-      internalToWrite[i] = DO_NOTHING;
+   client_t * client = all_clients;
+   while (client != NULL) {
+	   client->internalWriteStatus = DO_NOTHING;
+	   client = client->next;
    }
 
    struct timeval tv;
@@ -1798,20 +1883,18 @@ static void *writingFunc() {
 
    do {
 
-      client_t * client;
-
       //Fill internalToWrite using the write circular buffer.
       while (1) {
-         iClient = get_circ(toWriteBuffer);
-         if (iClient == CIRC_BUF_ERROR) {
-            //We stop filling if incomming buffer is empty.
-            break;
-         }
-         internalToWrite[iClient] = DO_WRITE;
-         if (all_clients[iClient].fd >= 0) {
-            add_client_to_master_write_set(&all_clients[iClient]);
-            FD_SET(all_clients[iClient].fd, &master_connect_fds);
-         }
+		  err = get_circ(toWriteBuffer, (void **)&client);
+		  if (err == CIRC_BUF_ERROR) {
+			  //We stop filling if incomming buffer is empty.
+			  break;
+		  }
+		  client->internalWriteStatus = DO_WRITE;
+		  if (client->fd >= 0) {
+			  add_client_to_master_write_set(client);
+			  FD_SET(client->fd, &master_connect_fds);
+		  }
       }
 
       memcpy(&master_connect_fds_select, &master_connect_fds, sizeof(master_connect_fds_select));
@@ -1822,14 +1905,12 @@ static void *writingFunc() {
       select(max_connect_socket+1, NULL, &master_connect_fds_select, NULL, &tv);
 
       //Check the internalTowrite for each client.
-      for (i=0; i<nb_clients; i++) {
-
+	  client = all_clients;
+	  while (client != NULL) {
          //If a client needs to connect or to write, let's do it.
-         if (internalToWrite[i] == DO_WRITE) {
+         if (client->internalWriteStatus == DO_WRITE) {
 
-            client = &all_clients[i];
-
-            if (client->state == ST_WRITING && FD_ISSET(all_clients[i].fd, &master_connect_fds_select)) {//WRITING
+            if (client->state == ST_WRITING && FD_ISSET(client->fd, &master_connect_fds_select)) {//WRITING
 
                //generate request only if needed
                if (client->new_request) {
@@ -1843,10 +1924,15 @@ static void *writingFunc() {
                //if we have gone to ST_READING, let's get out of the write thread, else, we stay here.
                if (newClientState == ST_READING) {
                   remove_client_from_master_write_set(client);
-                  internalToWrite[i] = DO_NOTHING;
+				  client->internalWriteStatus = DO_NOTHING;
                   //put in read file (or connect if 3 threads)
-                  if (put_circ(toReadBuffer, i) == CIRC_BUF_ERROR) {
-                     PANIC("put_circ l.%d error. should be impossible\n", __LINE__);
+                  if (put_circ(toReadBuffer, client) == CIRC_BUF_ERROR) {
+					  if (open_active) {
+						  PANIC("put_circ l.%d error, consider raising circular buffer size\n", __LINE__);
+					  }
+					  else {
+						  PANIC("put_circ l.%d error. should be impossible\n", __LINE__);
+					  }
                   }
                }
                else{
@@ -1854,21 +1940,23 @@ static void *writingFunc() {
                }
             }
             else if (client->state == ST_CONNECT) {//CONNECTING
-               if (all_clients[i].connect_in_progress &&
-            		   FD_ISSET(all_clients[i].fd, &master_connect_fds_select)) {
+               if (client->connect_in_progress &&
+            		   FD_ISSET(client->fd, &master_connect_fds_select)) {
 
                   finalize_connect_client_to_server(client);
 
                }
 
-               else if (!all_clients[i].connect_in_progress) {
+               else if (!client->connect_in_progress) {
                   //We have to connect because it is the first time we connect for the loop or we had an error before
                   initialize_connect_client_to_server(client);
                }
             }
 
          }//end if do_write
-      }//end for
+
+		 client = client->next;
+      }
 
       rdtscll(current_time_cycles);
 
@@ -1883,7 +1971,6 @@ static void *writingFunc() {
 
 
    DEBUG("writingFunc end\n");
-   free(internalToWrite);
    pthread_exit(NULL);
 
 }
@@ -1896,14 +1983,11 @@ static void *writingFunc() {
 static void *readingFunc() {
    DEBUG("readingFunc going...\n");
 
-   //indice gotten from the toReadBuffer.
-   int iClient;
-
-   //iterators
-   unsigned int i;
-
    //a client temp ptr
    client_t * client;
+
+   // return from circular buffer operations
+   int err;
 
    //a var to store the new client state
    states_t newClientState;
@@ -1926,6 +2010,9 @@ static void *readingFunc() {
    //Var usefull to make a good select
    int maxFd = -1;
 
+   //check if we need to go to the next client at the end of the loop
+   int next_client = 1;
+
 
    ///////////Init///////////
 
@@ -1934,33 +2021,36 @@ static void *readingFunc() {
    //useless because of memcopy:
    FD_ZERO(&readfds);
 
-   //This tab is indiced on the id of the client.
-   //It is used to associate the id of the clients to a local state (DO_NOTHING or DO_READ, nothing else).
-   int * internalToRead = malloc(sizeof(int) * nb_clients);
-
-   if (internalToRead == NULL) {
-      PANIC("Error allocating internalToRead table in readingFunc.\n");
-   }
-
-   //init internalToRead
-   for (i=0; i<nb_clients; i++) {
-      internalToRead[i] = DO_NOTHING;
+   //init read status
+   client = all_clients;
+   while (client != NULL) {
+	   client->internalReadStatus = DO_NOTHING;
+	   client = client->next;
    }
 
    ///////////Main read loop///////////
    uint64_t current_time_cycles;
+
+   // In open loop, the number of cycle to wait between the last request and the
+   // next one. Need to be decided each time a new request is created.
+   uint64_t next_request_cycles;
+   double next_seconds = 1.f / gaussrand(open_mean, open_var);
+   DEBUG("%f +- %f \t Next in %f\n", open_mean, open_var, next_seconds);
+   rdtscll(next_request_cycles);
+   next_request_cycles += (next_seconds * (double)proc_freq);
+
    do{
       //Fill internalToRead and master_read_set using the read circular buffer.
       while (1) {
-         iClient = get_circ(toReadBuffer);
-         if (iClient==CIRC_BUF_ERROR) {
-            //We stop filling if incomming buffer is empty.
-            break;
-         }
-         internalToRead[iClient] = DO_READ;
-         if (all_clients[iClient].fd > maxFd)
-            maxFd = all_clients[iClient].fd;
-         FD_SET(all_clients[iClient].fd, &master_read_set);
+		  err = get_circ(toReadBuffer, (void **)&client);
+		  if (err == CIRC_BUF_ERROR) {
+			  //We stop filling if incomming buffer is empty.
+			  break;
+		  }
+		  client->internalReadStatus = DO_READ;
+		  if (client->fd > maxFd)
+			  maxFd = client->fd;
+		  FD_SET(client->fd, &master_read_set);
       }
 
       if(maxFd<=-1) {
@@ -1983,11 +2073,15 @@ static void *readingFunc() {
          //finish();
       }
 
-      for (i=0; i < nb_clients; i++) {
+	  client = all_clients;
+	  client_t *prev = NULL;
+
+	  while (client != NULL) {
+
+		 next_client = 1;
 
          //Do read only if we need it.
-         if(internalToRead[i] == DO_READ) {
-            client = &all_clients[i];
+         if(client->internalReadStatus == DO_READ) {
             fd = client->fd;
 
             if(FD_ISSET(fd, &readfds))
@@ -1998,7 +2092,7 @@ static void *readingFunc() {
                //Check if we have a changed state.
                if(newClientState != ST_READING) {
 
-                  internalToRead[i] = DO_NOTHING;
+                  client->internalReadStatus = DO_NOTHING;
                   if (fd == maxFd) {
                      //search new maxFd
                      for(j= maxFd-1; j>=0; j--) {
@@ -2016,11 +2110,45 @@ static void *readingFunc() {
                   if(newClientState == ST_CONNECT || newClientState == ST_WRITING ) {
 
                      //put in write (or connect if 3 threads) queue
-                     if (put_circ(toWriteBuffer, i) == CIRC_BUF_ERROR) {
-                        PANIC("put_circ l.%d error. should be impossible\n", __LINE__);
+                     if (put_circ(toWriteBuffer, client) == CIRC_BUF_ERROR) {
+						 if (open_active) {
+							 PANIC("put_circ l.%d error, consider raising circular buffer size\n", __LINE__);
+						 }
+						 else {
+							 PANIC("put_circ l.%d error. should be impossible\n", __LINE__);
+						 }
                      }//end if circ error
 
                   }//end if put in write file
+
+				  // Client juste finished to work, delete it
+				  else if (newClientState == ST_ENDED) {
+
+					  assert(open_active == 1);
+
+					  // Potential concurrency problem?
+					  if (prev != NULL) {
+						  prev->next = client->next;
+					  }
+					  else {
+						  all_clients = client->next;
+					  }
+					  close(client->fd);
+
+					  //Needed for calculating throughput
+					  global_total_bytes_recv += client->total_bytes_recv;
+					  global_total_resp_recv += client->total_resp_recv;
+
+					  // Compute errors
+					  global_errors += client->errors;
+
+					  DEBUG("Client %d just finished.\n", client->number);
+
+					  client_t * next = client->next;
+					  next_client = 0;
+					  free(client);
+					  client = next;
+				  }
 
                }//end if changed state
 
@@ -2028,12 +2156,44 @@ static void *readingFunc() {
 
          }//end if do_read
 
+		 if (next_client) {
+			 prev = client;
+			 client = client->next;
+		 }
       }//end for
 
       rdtscll(current_time_cycles);
-   } while((current_time_cycles - start_time_cycles) < duration); //end while
 
-   free(internalToRead);
+	  // Create new requests based on rdtscll difference
+	  if (open_active) {
+		  while (current_time_cycles > next_request_cycles) {
+			  // Create a new client for a new request
+			  // Concurrency issue?
+			  client_t *new_client = (client_t *)calloc(1, sizeof(client_t));
+			  assert(new_client != NULL);
+
+			  new_client->number = client_counter++;
+			  new_client->fd = -1;
+			  DEBUG("New client %d created at %s\n", client_counter - 1, getCurrentTime());
+			  new_client->state = ST_CONNECT;
+			  new_client->new_request = 1;
+
+#if !MULTIPLE_INTERFACES
+			  init_server_target(new_client, host, port);
+#endif
+			  // Put into circular buffer for next time
+			  put_circ(toWriteBuffer, new_client);
+			  new_client->next = all_clients;
+			  all_clients = new_client;
+
+			  // Compute time to next request
+			  double next_seconds = 1.f / gaussrand(open_mean, open_var);
+			  DEBUG("Next in %f\n", next_seconds);
+			  next_request_cycles += (next_seconds * (double)proc_freq);
+		  }
+	  }
+
+   } while((current_time_cycles - start_time_cycles) < duration); //end while
 
    pthread_exit(NULL);
 }
@@ -2089,7 +2249,18 @@ void send_stat_response(int masterOrderSocket) {
  */
 void reset_stats() {
    //reset clients:
-   free(all_clients);
+   if (open_active) {
+	   client_t * client = all_clients;
+	   client_t * next = NULL;
+	   while (client != NULL) {
+		   next = client->next;
+		   free(client);
+		   client = next;
+	   }
+   }
+   else {
+	   free(all_clients);
+   }
 
    global_avgCT = 0;
    global_avgRT = 0;
@@ -2213,7 +2384,21 @@ int waitMasterOrder(int masterOrderSocket, char* req) {
 
    DEBUG("Received data: %s\n", buffer);
 
-   //format: slave_num, reportingAddress, host, port, nb_clients, duration, nb_msg_per_connection, delay, fastcgi_base_path
+   /** params:
+	* - slave_number
+	* - reportingAddress
+	* - host
+	* - port
+	* - nb_clients
+	* - nb_iterations
+	* - nb_msg_per_connection
+	* - delay
+	* - slaves_interval_avg_percent
+	* - fastcgi_base_path
+	* - open_active
+	* - open_mean
+	* - open_var
+	*/
 
    const char delimiters[] = ",";
    char *token;
@@ -2248,20 +2433,44 @@ int waitMasterOrder(int masterOrderSocket, char* req) {
    token = strtok(NULL, delimiters);
    fastcgi_base_path = token;
 
-   DEBUG( "Parameters: slave_num: %d, reportingAddress: %s, host:%s, port:%d, nb_clients:%d, duration:%llu, nb_msg_per_connection:%d, delay:%d, fastcgi_base_path:%s\n",
-		  slave_num, reportingAddress, host, port, nb_clients, duration, nb_msg_per_connection, delay, fastcgi_base_path);
-   
+   token = strtok(NULL, delimiters);
+   open_active = atoi(token);
+
+   token = strtok(NULL, delimiters);
+   open_mean = atof(token);
+
+   token = strtok(NULL, delimiters);
+   open_var = atof(token);
+
+   DEBUG( "Parameters: slave_num: %d, "
+		  "reportingAddress: %s, "
+		  "host:%s, "
+		  "port:%d, "
+		  "nb_clients:%d, "
+		  "duration:%llu, "
+		  "nb_msg_per_connection:%d, "
+		  "delay:%d, "
+		  "fastcgi_base_path:%s"
+		  "open_active:%d, "
+		  "open_mean:%f, "
+		  "open_var:%f, "
+		  "\n",
+		  slave_num, reportingAddress, host, port, nb_clients, duration,
+		  nb_msg_per_connection, delay, fastcgi_base_path,
+		  open_active, open_mean, open_var);
+
    return 1;
 
 }
 
 //Close sockets of clients which still have request to do after bench time has expired.
 void clean_remaing_clients_fd(){
-   unsigned int i;
    client_t *client;
-   for (i=0; i<nb_clients; i++) {
-      client = &all_clients[i];
-      close(client->fd);
+
+   client = all_clients;
+   while (client != NULL) {
+	   close(client->fd);
+	   client = client->next;
    }
 }
 
@@ -2272,7 +2481,6 @@ int main(int argc, char** argv) {
 
    DEBUG("compiled at: %s %s\n",__TIME__ , __DATE__ );
 
-   unsigned int i;
    int masterOrderSocket;
 
    //GET PARAMETERS
@@ -2360,6 +2568,8 @@ int main(int argc, char** argv) {
       // Print parameters
       DEBUG("Parameters: host:%s, port:%d, nb_clients:%d, duration:%llu, nb_msg_per_connection:%d, delay:%d\n",
                host, port, nb_clients, duration, nb_msg_per_connection, delay);
+	  DEBUG("            open_active:%d, open_mean:%f, open_var:%f\n",
+               open_active, open_mean, open_var);
       DEBUG("-----------------------------------------------------\n");
 
       //CHECK PARAMETERS
@@ -2381,18 +2591,26 @@ int main(int argc, char** argv) {
       toWriteBuffer = malloc(sizeof(circularBuffer));
 
       //Init circular buffers.
-      toReadBuffer = open_circ(toReadBuffer, nb_clients);
-      toWriteBuffer = open_circ(toWriteBuffer, nb_clients);
+	  if (open_active) {
+		  toReadBuffer = open_circ(toReadBuffer, 2 * MAX_CLIENTS);
+		  toWriteBuffer = open_circ(toWriteBuffer, 2 * MAX_CLIENTS);
+	  }
+	  else {
+		  toReadBuffer = open_circ(toReadBuffer, nb_clients);
+		  toWriteBuffer = open_circ(toWriteBuffer, nb_clients);
+	  }
 
       if (toReadBuffer==NULL || toReadBuffer==NULL) {
          printf("malloc error while creating circular buffers.\n");
          exit(-1);
       }
 
-      //Put all clients in the write queue because they will have to connect.
-      for (i=0; i<nb_clients; i++) {
-         put_circ(toWriteBuffer, i);
-      }
+	  //Put all clients in the write queue because they will have to connect.
+	  client_t * client = all_clients;
+	  while (client != NULL) {
+		  put_circ(toWriteBuffer, client);
+		  client = client->next;
+	  }
 
       if (duration < 1) {
          printf("Test duration too low.\n");
@@ -2436,26 +2654,27 @@ int main(int argc, char** argv) {
       if (global_total_resp_recv == 0) {
          PRINT_ALERT("WARNING: No response received in this iteration\n");
          client_t * client;
-         unsigned int i;
          int nb_have_written = 0;
          int nb_connecting = 0;
          float nb_connect_attempts_in_progress = 0;
          int nb_have_done_nothing = 0;
-         for (i = 0; i < nb_clients; i++) {
 
-            client = &all_clients[i];
+		 client = all_clients;
+		 while (client != NULL) {
 
-            if (client->connect_in_progress){
-               nb_connecting++;
-               nb_connect_attempts_in_progress += (client->nb_connect_attempts ? client->nb_connect_attempts : 1);
-            }
-            else if (client->bytes_write) {
-               nb_have_written++;
-            }
-            else {
-               nb_have_done_nothing++;
-            }
-         }
+			 if (client->connect_in_progress){
+				 nb_connecting++;
+				 nb_connect_attempts_in_progress += (client->nb_connect_attempts ? client->nb_connect_attempts : 1);
+			 }
+			 else if (client->bytes_write) {
+				 nb_have_written++;
+			 }
+			 else {
+				 nb_have_done_nothing++;
+			 }
+
+			 client = client->next;
+		 }
 
          PRINT_ALERT("\t%d clients have written but no answer.\n", nb_have_written);
          PRINT_ALERT("\t%d clients have trying to connect (avg attempts: %.2f %%).\n", nb_connecting, (nb_connecting)?(nb_connect_attempts_in_progress/nb_connecting):0);

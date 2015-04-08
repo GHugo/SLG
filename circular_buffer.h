@@ -41,7 +41,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
  * **************************************************/
 typedef struct
 {
-int *buffer;
+void * *buffer;
 int size;
 int writePos;
 int readPos;
@@ -67,13 +67,13 @@ void close_circ(circularBuffer *cb);
 /**************************************************
  * Get the head element from the circular buffer.
  * *************************************************/
-int get_circ(circularBuffer *cb);
+int get_circ(circularBuffer *cb, void **value);
 
 
 /**************************************************
  * Put an element in the circular buffer.
  * ***********************************************/
-int put_circ(circularBuffer *cb, int e);
+int put_circ(circularBuffer *cb, void * e);
 
 
 /******************************************

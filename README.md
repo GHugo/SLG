@@ -18,3 +18,7 @@ TODO / Known issues
 ===================
 
 * Use libgsl for statistics
+* Don't work inside valgrind (see [here](http://stackoverflow.com/questions/8663148/valgrind-stalls-in-multithreaded-socket-program))
+* select(2) prevent to have more than 1024 (FD_SETSIZE) connections simultaneously. Need to use poll/epoll.
+
+

@@ -72,6 +72,11 @@ unsigned int nb_msg_per_connection = 0;
 unsigned int delay = 0;
 char * fastcgi_base_path;
 
+// Open mode normal law parameters (+active)
+double open_mean;
+double open_var;
+char open_active; // 1 = open-loop, 0 = closed loop [default]
+
 int percent_stats_kept_master = 100;
 
 /** If not N-Copy only one server is targeted
@@ -180,6 +185,15 @@ void parse_config_file(char * conf_file) {
       else if (strcmp(param, "fastcgi_base_path") == 0) {
          fastcgi_base_path = value;
       }
+	  else if (strcmp(param, "open_active") == 0) {
+   	     open_active = atoi(value);
+	  }
+	  else if (strcmp(param, "open_mean") == 0) {
+		 open_mean = atof(value);
+	  }
+	  else if (strcmp(param, "open_var") == 0) {
+		  open_var = atof(value);
+	  }
       else {
          PANIC("unknown config parameter line %d: %s\n", line_num, param);
       }
@@ -206,6 +220,9 @@ void print_help_message() {
    printf("\t--file* (-f): config file\n");
    printf("\t-r: dump a summary on stderr to know where is the bench when redirecting in a file\n");
    printf("\t--fastcgi_base_path* (-b): base path for fastcgi request (where fcgi scripts are)\n");
+   printf("\t--open_active* (-o): inject in open loop (1 = open loop, 0 = closed loop [default])\n");
+   printf("\t--open_mean*: the mean of a normal law (requests / s) for open loop injection\n");
+   printf("\t--open_var*: the variance of a normal law (requests / s) for open loop injection\n");
 
    printf("Parameters with a * are optionnal, all  others are mandatory.\n");
    printf("The parameters from the command line overide the ones in the config file .\n");
@@ -256,6 +273,10 @@ void check_all_parameters_filled() {
       PANIC("Unknown value for warmup");
    }
 
+   if (open_active && (open_mean <= 0.f || open_var <= 0.f)) {
+      PANIC("Open loop asked but open_mean or open_var is not strictly greater than 0.0");
+   }
+
 #ifdef FASTCGI_PROTOCOL
    if (fastcgi_base_path == NULL) {
       PANIC("fastcgi_base_path not initialized.\n");
@@ -286,6 +307,10 @@ void parse_command_line(int argc, char** argv) {
 
    while (1) {
       int option_index = 0;
+
+#define OPT_OPEN_MEAN 1000
+#define OPT_OPEN_VAR 1001
+
       static struct option long_options[] =
       {
                { "nb_iterations", 1, 0, 'i' },
@@ -301,6 +326,9 @@ void parse_command_line(int argc, char** argv) {
                { "help", 0, 0, 'h' },
                { "file", 1, 0, 'f' },
                { "fastcgi_base_path", 1, 0, 'b' },
+			   { "open_active", 0, 0, 'o' },
+			   { "open_mean", 1, 0, OPT_OPEN_MEAN },
+			   { "open_var", 1, 0, OPT_OPEN_VAR },
                { 0, 0, 0, 0 }
       };
 
@@ -367,6 +395,18 @@ void parse_command_line(int argc, char** argv) {
          case 'b':
             fastcgi_base_path = optarg;
             break;
+
+         case 'o':
+            open_active = atoi(optarg);
+			break;
+
+         case OPT_OPEN_MEAN:
+			 open_mean = atof(optarg);
+			 break;
+
+	     case OPT_OPEN_VAR:
+			 open_var = atof(optarg);
+			 break;
 
          default:
             exit(EXIT_FAILURE);
@@ -468,10 +508,18 @@ void print_stats(int nb_client_min, int step, int nbSlaves, int wave_num) {
    int w = wave_num;
 
    if (more_output_for_stderr) {
-      fprintf(stderr, "[ %s ] %5d clients done, throughput: %Lf, stddev: %Lf\n",
-               getCurrentTime(),(nb_client_min+(w*step))*nbSlaves,
-               average_Lf(&master_stats[w].resp_rate),
-               stddev_Lf(&master_stats[w].resp_rate));
+	   if (!open_active) {
+		   fprintf(stderr, "[ %s ] %5d clients done, throughput: %Lf, stddev: %Lf\n",
+				   getCurrentTime(),(nb_client_min+(w*step))*nbSlaves,
+				   average_Lf(&master_stats[w].resp_rate),
+				   stddev_Lf(&master_stats[w].resp_rate));
+	   }
+	   else {
+		   fprintf(stderr, "[ %s ] N(%f, %f) * %d waves * %d steps * %d slaves done, throughput: %Lf, stddev: %Lf\n",
+				   getCurrentTime(), open_mean, open_var, w, step, nbSlaves,
+				   average_Lf(&master_stats[w].resp_rate),
+				   stddev_Lf(&master_stats[w].resp_rate));
+	   }
    }
 
 
@@ -490,30 +538,58 @@ void print_stats(int nb_client_min, int step, int nbSlaves, int wave_num) {
    long double errors_avg = percentil_average_Lf(&master_stats[w].errors, percent_stats_kept_master);
    long double errors_stddev = percentil_stddev_Lf(&master_stats[w].errors, percent_stats_kept_master);
 
-   //nb_clients*nbSlaves, master_stats.req_throughput, master_stats.bytes_throughput, master_stats.avgCT, master_stats.avgRT, master_stats.avgCRT, master_stats.totalTime
-   printf("%5d"
-            "\t%15.02Lf %3.02Lf%%"
-            "\t%15.02Lf %3.02Lf%%"
-            "\t%15.02Lf %3.02Lf%%"
-            "\t%15.02Lf %3.02Lf%%"
-            "\t%15.02Lf %3.02Lf%%"
-            "\t%15.02Lf %3.02Lf%%"
-            "\t%15.02Lf %3.02Lf%%\n",
-            (nb_client_min+(w*step))*nbSlaves,
-            resp_rate_avg,
-            resp_rate_stddev * 100. / resp_rate_avg,
-            bytes_rate_avg / (1024.*1024.) * 8.,
-            bytes_rate_stddev / bytes_rate_avg * 100.,
-            ct_avg,
-            ct_stddev * 100. / ct_avg,
-            rt_avg,
-            rt_stddev * 100. / rt_avg,
-            crt_avg,
-            crt_stddev * 100. / crt_avg,
-            tt_avg,
-            tt_stddev * 100. / tt_avg,
-            errors_avg,
-            errors_stddev * 100. / errors_avg );
+   if (!open_active) {
+	   //nb_clients*nbSlaves, master_stats.req_throughput, master_stats.bytes_throughput, master_stats.avgCT, master_stats.avgRT, master_stats.avgCRT, master_stats.totalTime
+	   printf("%5d"
+			  "\t%15.02Lf %3.02Lf%%"
+			  "\t%15.02Lf %3.02Lf%%"
+			  "\t%15.02Lf %3.02Lf%%"
+			  "\t%15.02Lf %3.02Lf%%"
+			  "\t%15.02Lf %3.02Lf%%"
+			  "\t%15.02Lf %3.02Lf%%"
+			  "\t%15.02Lf %3.02Lf%%\n",
+			  (nb_client_min+(w*step))*nbSlaves,
+			  resp_rate_avg,
+			  resp_rate_stddev * 100. / resp_rate_avg,
+			  bytes_rate_avg / (1024.*1024.) * 8.,
+			  bytes_rate_stddev / bytes_rate_avg * 100.,
+			  ct_avg,
+			  ct_stddev * 100. / ct_avg,
+			  rt_avg,
+			  rt_stddev * 100. / rt_avg,
+			  crt_avg,
+			  crt_stddev * 100. / crt_avg,
+			  tt_avg,
+			  tt_stddev * 100. / tt_avg,
+			  errors_avg,
+			  errors_stddev * 100. / errors_avg );
+   }
+   else {
+	   //open_mean, open_var, waves, steps, nbSlaves, master_stats.req_throughput, master_stats.bytes_throughput, master_stats.avgCT, master_stats.avgRT, master_stats.avgCRT, master_stats.totalTime
+	   printf("%f %f %d %d %d"
+			  "\t%15.02Lf %3.02Lf%%"
+			  "\t%15.02Lf %3.02Lf%%"
+			  "\t%15.02Lf %3.02Lf%%"
+			  "\t%15.02Lf %3.02Lf%%"
+			  "\t%15.02Lf %3.02Lf%%"
+			  "\t%15.02Lf %3.02Lf%%"
+			  "\t%15.02Lf %3.02Lf%%\n",
+			  open_mean, open_var, w, step, nbSlaves,
+			  resp_rate_avg,
+			  resp_rate_stddev * 100. / resp_rate_avg,
+			  bytes_rate_avg / (1024.*1024.) * 8.,
+			  bytes_rate_stddev / bytes_rate_avg * 100.,
+			  ct_avg,
+			  ct_stddev * 100. / ct_avg,
+			  rt_avg,
+			  rt_stddev * 100. / rt_avg,
+			  crt_avg,
+			  crt_stddev * 100. / crt_avg,
+			  tt_avg,
+			  tt_stddev * 100. / tt_avg,
+			  errors_avg,
+			  errors_stddev * 100. / errors_avg );
+   }
 
 #if DEBUG_TASK
    for (w = 0; w < NB_PRINT_SEPARATORS; w++) {
@@ -767,17 +843,31 @@ void send_order_to_slaves(slaves_infos_t * slaves, int nb_slaves, int warmup) {
 
       gethostname(name, 255);
 
-      //creating the query string to send to the slaves.
-      //params: slave_number, reportingAddress, host, port, nb_clients, nb_iterations, nb_msg_per_connection, delay, slaves_interval_avg_percent, fastcgi_base_path
+	  /** creating the query string to send to the slaves.
+	   * params:
+	   * - slave_number
+	   * - reportingAddress
+	   * - host
+	   * - port
+	   * - nb_clients
+	   * - nb_iterations
+	   * - nb_msg_per_connection
+	   * - delay
+	   * - slaves_interval_avg_percent
+	   * - fastcgi_base_path
+	   * - open_active
+	   * - open_mean
+	   * - open_var
+	   */
       int _duration = duration;
       if(warmup){
          _duration = warmup_length;
       }
 
-      sprintf(msg, "%d,%s,%s,%d,%d,%d,%d,%d,%s\n",
+      sprintf(msg, "%d,%s,%s,%d,%d,%d,%d,%d,%s,%d,%f,%f\n",
                i, name, slaves[i].target, slaves[i].target_port,
                nb_clients, _duration, nb_msg_per_connection,
-              delay, fastcgi_base_path);
+              delay, fastcgi_base_path, open_active, open_mean, open_var);
 
       cnt = 0;
       do {
@@ -942,6 +1032,13 @@ void print_parameter_summary(FILE* output) {
             percent_stats_kept_master, SLEEP_TIME_BETWEEN_TWO_ITERATIONS, warmup_length,
             fastcgi_base_path);
 
+   if (open_active) {
+	   fprintf(output, "\t- Using Open-Loop injection following N(%f, %f)\n", open_mean, open_var);
+   }
+   else {
+	   fprintf(output, "\t- Using Closed-Loop injection\n");
+   }
+
 #ifdef USE_RST
    fprintf(output,"\t- Using RST flag for closing connection\n");
 #endif
@@ -1072,13 +1169,25 @@ int main(int argc, char** argv) {
       fprintf(stderr, "\n##########################\n");
       int remains_sec = (wave_length * (nb_waves - current_wave_number ));
 
-      fprintf(stderr, "%d clients [test %d / %d, %d min %d sec]\n",
-               nb_clients*nb_slaves,
-               (current_wave_number + 1),
-               nb_waves,
-               remains_sec / 60,
-               remains_sec - (remains_sec / 60)*60
-               );
+	  if (!open_active) {
+		  fprintf(stderr, "%d clients [test %d / %d, %d min %d sec]\n",
+				  nb_clients*nb_slaves,
+				  (current_wave_number + 1),
+				  nb_waves,
+				  remains_sec / 60,
+				  remains_sec - (remains_sec / 60)*60
+			  );
+	  }
+	  else {
+		  fprintf(stderr, "open-loop N(%f, %f) [test %d / %d, %d min %d sec]\n",
+				  open_mean, open_var,
+				  (current_wave_number + 1),
+				  nb_waves,
+				  remains_sec / 60,
+				  remains_sec - (remains_sec / 60)*60
+			  );
+	  }
+
       fprintf(stderr, "##########################\n");
 
       warmup_time();
