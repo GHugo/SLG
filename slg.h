@@ -59,7 +59,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 #define NON_BLOCKING_SOCKET 1
 
 // Number of maximum clients which this injector can simulate
-#define MAX_CLIENTS 1024
+#define MAX_CLIENTS 8192
 
 // Default server dir (generally /) ended by a /
 #define DEFAULT_DIR "/"
@@ -157,6 +157,7 @@ typedef struct client_t {
 
 	// Client list as linked list
 	struct client_t *next;
+	struct client_t *prev;
 
 	// Current status regarding reader/writer thread
 	int internalReadStatus;

@@ -18,6 +18,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 */
 
 #define _GNU_SOURCE
+
 #include <stdlib.h>
 #include <stdio.h>
 #include <stddef.h>
@@ -29,25 +30,19 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 #include <time.h>
 #include <math.h>
 #include <pthread.h>
-
 #include <assert.h>
-
 #include <netinet/in.h>
 #include <netinet/tcp.h>
-
-#include <sys/types.h>
-#include <sys/socket.h>
-#include <sys/time.h>
-
-#include <sys/un.h>
-#define UNIX_PATH_MAX    108
-
 #include <arpa/inet.h>
 #include <netdb.h>
-
 #include <signal.h>
-
 #include <time.h>
+#include <sys/un.h>
+#define UNIX_PATH_MAX    108
+#include <sys/types.h>
+#include <sys/epoll.h>
+#include <sys/time.h>
+
 // Include the header
 #include "slg.h"
 #define DO_NOTHING 0
@@ -140,9 +135,8 @@ int masterListenOrderSocket;
 char name[256];
 struct sockaddr_in server_addr;
 
-//Master fds for connect
-fd_set master_connect_fds;
-int max_connect_socket = 0;
+//Master epoll for connect
+int master_connect_epl;
 
 //write thread fills it, read thread empties it.
 circularBuffer * toReadBuffer;
@@ -657,7 +651,6 @@ void init_client_socket(client_t* client) {
       perror("socket");
       exit(EXIT_FAILURE);
    }
-   assert(client->fd < FD_SETSIZE);
 
    //Enables local address reuse
    if (setsockopt(client->fd, SOL_SOCKET, SO_REUSEADDR, &reuse_addr, sizeof(reuse_addr))
@@ -695,30 +688,16 @@ void init_client_socket(client_t* client) {
 }
 
 void add_client_to_master_write_set(client_t* client) {
-   FD_SET(client->fd, &master_connect_fds);
+    struct epoll_event ev;
+    ev.events = EPOLLOUT | EPOLLERR | EPOLLHUP;
+    ev.data.ptr = (void *)client;
 
-   if( (client->fd) > max_connect_socket) {
-      max_connect_socket = client->fd;
-   }
+    DEBUG("Adding client %d with fd %d to master write set\n", client->number, client->fd);
+    assert(epoll_ctl(master_connect_epl, EPOLL_CTL_ADD, client->fd, &ev) == 0);
 }
 
 void remove_client_from_master_write_set(client_t* client) {
-
-   FD_CLR(client->fd, &master_connect_fds);
-   if(max_connect_socket == client->fd) {
-      //finding new max num socket
-      int i;
-      for(i=max_connect_socket-1; i>=0;i--) {
-         if(FD_ISSET(i, &master_connect_fds)) {
-            max_connect_socket = i;
-            break;
-         }
-      }
-      if(i<0) {
-         //No socket to select
-         max_connect_socket = 0;
-      }
-   }
+    assert(epoll_ctl(master_connect_epl, EPOLL_CTL_DEL, client->fd, NULL) == 0);
 }
 
 /**
@@ -1757,6 +1736,17 @@ void init_clients() {
 			   client->next = &all_clients[i + 1];
 		   }
 	   }
+	   if (i == 0) {
+		   client->prev = NULL;
+	   }
+	   else {
+		   if (open_active) {
+			   client->prev = open_client_list[i - 1];
+		   }
+		   else {
+			   client->prev = &all_clients[i - 1];
+		   }
+	   }
    }
 
    //init stats
@@ -1880,8 +1870,8 @@ static void *writingFunc() {
 	   client = client->next;
    }
 
-   struct timeval tv;
-   fd_set master_connect_fds_select;
+   struct epoll_event events[MAX_CLIENTS];
+   bzero(events, sizeof(events));
 
    //Main write loop
    uint64_t current_time_cycles;
@@ -1896,72 +1886,79 @@ static void *writingFunc() {
 			  //We stop filling if incomming buffer is empty.
 			  break;
 		  }
+          DEBUG("New client for writer thread.\n");
 		  client->internalWriteStatus = DO_WRITE;
 		  if (client->fd >= 0) {
 			  add_client_to_master_write_set(client);
-			  FD_SET(client->fd, &master_connect_fds);
-		  }
+		  } else {
+              if (client->internalWriteStatus == DO_WRITE) {
+                  if (client->state == ST_CONNECT) {//CONNECTING
+                      if (!client->connect_in_progress) {
+                          //We have to connect because it is the first time we connect for the loop or we had an error before
+                          initialize_connect_client_to_server(client);
+                      }
+                  }
+              }
+          }
       }
 
-      memcpy(&master_connect_fds_select, &master_connect_fds, sizeof(master_connect_fds_select));
-      tv.tv_sec = 0;
-      tv.tv_usec = 0;
+      // Epoll
+      int nfds = epoll_wait(master_connect_epl, events, MAX_CLIENTS, 0);
 
-      //Select
-      select(max_connect_socket+1, NULL, &master_connect_fds_select, NULL, &tv);
+      // Go through all available clients
+      int i = 0;
+      for (i = 0; i < nfds; i++) {
+          client = (client_t *)events[i].data.ptr;
 
-      //Check the internalTowrite for each client.
-	  client = all_clients;
-	  while (client != NULL) {
-         //If a client needs to connect or to write, let's do it.
-         if (client->internalWriteStatus == DO_WRITE) {
+          // Should not be the case, EPOLL error
+          if ((events[i].events & EPOLLERR) ||
+              (events[i].events & EPOLLHUP) ||
+              (!(events[i].events & EPOLLOUT))) {
+              int error = 0;
+              socklen_t errlen = sizeof(error);
+              if (getsockopt(client->fd, SOL_SOCKET, SO_ERROR, (void *)&error, &errlen) == 0) {
+                  PANIC("Receiving error while writing, error %s for client %d.\n", strerror(error), client->number);
+              }
+              PANIC("Receiving error while writing, unkown error for client %d.\n", client->number);
+          }
+          //If a client needs to connect or to write, let's do it.
+          else if (client->internalWriteStatus == DO_WRITE) {
 
-            if (client->state == ST_WRITING && FD_ISSET(client->fd, &master_connect_fds_select)) {//WRITING
-
-               //generate request only if needed
-               if (client->new_request) {
-                  BUILD_REQUEST(client);
-               }
-
-               DEBUG("Client %d just sent request\n", client->number);
-
-               newClientState = send_request(client);
-
-               //if we have gone to ST_READING, let's get out of the write thread, else, we stay here.
-               if (newClientState == ST_READING) {
-                  remove_client_from_master_write_set(client);
-				  client->internalWriteStatus = DO_NOTHING;
-                  //put in read file (or connect if 3 threads)
-                  if (put_circ(toReadBuffer, client) == CIRC_BUF_ERROR) {
-					  if (open_active) {
-						  PANIC("put_circ l.%d error, consider raising circular buffer size\n", __LINE__);
-					  }
-					  else {
-						  PANIC("put_circ l.%d error. should be impossible\n", __LINE__);
-					  }
+              if (client->state == ST_WRITING) {//WRITING
+                  //generate request only if needed
+                  if (client->new_request) {
+                      BUILD_REQUEST(client);
                   }
-               }
-               else{
-                  PANIC("After ST_WRITING must come ST_READING\n");
-               }
-            }
-            else if (client->state == ST_CONNECT) {//CONNECTING
-               if (client->connect_in_progress &&
-            		   FD_ISSET(client->fd, &master_connect_fds_select)) {
 
-                  finalize_connect_client_to_server(client);
+                  DEBUG("Client %d just sent request\n", client->number);
 
-               }
+                  newClientState = send_request(client);
 
-               else if (!client->connect_in_progress) {
-                  //We have to connect because it is the first time we connect for the loop or we had an error before
-                  initialize_connect_client_to_server(client);
-               }
-            }
+                  //if we have gone to ST_READING, let's get out of the write thread, else, we stay here.
+                  if (newClientState == ST_READING) {
+                      remove_client_from_master_write_set(client);
+                      client->internalWriteStatus = DO_NOTHING;
+                      //put in read file (or connect if 3 threads)
+                      if (put_circ(toReadBuffer, client) == CIRC_BUF_ERROR) {
+                          if (open_active) {
+                              PANIC("put_circ l.%d error, consider raising circular buffer size\n", __LINE__);
+                          }
+                          else {
+                              PANIC("put_circ l.%d error. should be impossible\n", __LINE__);
+                          }
+                      }
+                  }
+                  else{
+                      PANIC("After ST_WRITING must come ST_READING\n");
+                  }
 
-         }//end if do_write
-
-		 client = client->next;
+              }
+              else if (client->state == ST_CONNECT) {//CONNECTING
+                  if (client->connect_in_progress) {
+                      finalize_connect_client_to_server(client);
+                  }
+              }
+          }
       }
 
       rdtscll(current_time_cycles);
@@ -1975,6 +1972,7 @@ static void *writingFunc() {
 
    } while((current_time_cycles - start_time_cycles) < duration); //end while
 
+   close(master_connect_epl);
 
    DEBUG("writingFunc end\n");
    pthread_exit(NULL);
@@ -1999,33 +1997,17 @@ static void *readingFunc() {
    states_t newClientState;
 
    //Read set where to look for sockets are put
-   fd_set master_read_set;
+   int master_read_epl;
+   struct epoll_event events[MAX_CLIENTS];
+   struct epoll_event ev;
 
-   //set which is overwritten by master_read_set before select
-   fd_set readfds;
+   bzero(events, sizeof(events));
+   bzero(&ev, sizeof(ev));
 
    //select return value
    int num_ready;
 
-   //iterator
-   int j;
-
-   //a var to store a fd number.
-   int fd;
-
-   //Var usefull to make a good select
-   int maxFd = -1;
-
-   //check if we need to go to the next client at the end of the loop
-   int next_client = 1;
-
-
    ///////////Init///////////
-
-   FD_ZERO(&master_read_set);
-
-   //useless because of memcopy:
-   FD_ZERO(&readfds);
 
    //init read status
    client = all_clients;
@@ -2041,166 +2023,161 @@ static void *readingFunc() {
    // next one. Need to be decided each time a new request is created.
    uint64_t next_request_cycles;
    double next_seconds = 1.f / gaussrand(open_mean, open_var);
-   DEBUG("%f +- %f \t Next in %f\n", open_mean, open_var, next_seconds);
+   if (open_active) {
+       DEBUG("%f +- %f \t Next in %f\n", open_mean, open_var, next_seconds);
+   }
+
    rdtscll(next_request_cycles);
    next_request_cycles += (next_seconds * (double)proc_freq);
 
+   master_read_epl = epoll_create(MAX_CLIENTS);
+   assert(master_read_epl != -1);
+
    do{
-      //Fill internalToRead and master_read_set using the read circular buffer.
-      while (1) {
-		  err = get_circ(toReadBuffer, (void **)&client);
-		  if (err == CIRC_BUF_ERROR) {
-			  //We stop filling if incomming buffer is empty.
-			  break;
-		  }
-		  client->internalReadStatus = DO_READ;
-		  if (client->fd > maxFd)
-			  maxFd = client->fd;
-		  FD_SET(client->fd, &master_read_set);
-      }
+       //Fill internalToRead and master_read_set using the read circular buffer.
+       while (1) {
+           err = get_circ(toReadBuffer, (void **)&client);
+           if (err == CIRC_BUF_ERROR) {
+               //We stop filling if incomming buffer is empty.
+               break;
+           }
+           client->internalReadStatus = DO_READ;
+           ev.data.ptr = (void *)client;
+           ev.events = EPOLLIN | EPOLLERR | EPOLLHUP;
 
-      if(maxFd<=-1) {
-         rdtscll(current_time_cycles);
-         continue;
-      }
+           assert(epoll_ctl(master_read_epl, EPOLL_CTL_ADD, client->fd, &ev) == 0);
+       }
 
-      //Setting select set.
-      memcpy(&readfds, &master_read_set, sizeof(readfds));
+       num_ready = epoll_wait(master_read_epl, events, MAX_CLIENTS, 0);
 
-      struct timeval zero_time;
-      zero_time.tv_sec = 0;
-      zero_time.tv_usec = 0;
+       if (num_ready < 0) {
+           perror("epoll");
+           exit(0);
+           //finish();
+       }
 
-      num_ready = select(maxFd + 1, &readfds, NULL, NULL, &zero_time);
+       // Go through all available clients
+       int i = 0;
+       for (i = 0; i < num_ready; i++) {
+           client = (client_t *)events[i].data.ptr;
 
-      if (num_ready < 0) {
-         perror("select");
-         exit(0);
-         //finish();
-      }
-
-	  client = all_clients;
-	  client_t *prev = NULL;
-
-	  while (client != NULL) {
-
-		 next_client = 1;
-
-         //Do read only if we need it.
-         if(client->internalReadStatus == DO_READ) {
-            fd = client->fd;
-
-            if(FD_ISSET(fd, &readfds))
-            {
+           // Should not be the case, EPOLL error
+           if ((events[i].events & EPOLLERR) ||
+               (events[i].events & EPOLLHUP) ||
+               (!(events[i].events & EPOLLIN))) {
+               int error = 0;
+               socklen_t errlen = sizeof(error);
+               if (getsockopt(client->fd, SOL_SOCKET, SO_ERROR, (void *)&error, &errlen) == 0) {
+                   PANIC("Receiving error while reading, error %s for client %d.\n", strerror(error), client->number);
+               }
+               PANIC("Receiving error while reading, unkown error for client %d.\n", client->number);
+           }
+           //Do read only if we need it.
+           if(client->internalReadStatus == DO_READ && events[i].events & EPOLLIN) {
                //read response
                newClientState = read_response(client);
 
                //Check if we have a changed state.
                if(newClientState != ST_READING) {
 
-                  client->internalReadStatus = DO_NOTHING;
-                  if (fd == maxFd) {
-                     //search new maxFd
-                     for(j= maxFd-1; j>=0; j--) {
-                        if(FD_ISSET(j, &master_read_set))
-                           maxFd = j;
-                        break;
-                     }
-                     if(j == -1) {
-                        maxFd = -2;
-                     }
-                  }
+                   client->internalReadStatus = DO_NOTHING;
+                   // No need to remove from this pool, the socket was closed in read_response (and thus remove).
+                   /*
+                     if (epoll_ctl(master_read_epl, EPOLL_CTL_DEL, fd, NULL) != 0) {
+                         PANIC("Error while remove from read set fd = %d, client = %d, error = %s.\n", fd, client->number, strerror(errno));
+                     }*/
 
-                  FD_CLR(fd, &master_read_set);
+                   if(newClientState == ST_CONNECT || newClientState == ST_WRITING ) {
+                       //put in write (or connect if 3 threads) queue
+                       if (put_circ(toWriteBuffer, client) == CIRC_BUF_ERROR) {
+                           if (open_active) {
+                               PANIC("put_circ l.%d error, consider raising circular buffer size\n", __LINE__);
+                           }
+                           else {
+                               PANIC("put_circ l.%d error. should be impossible\n", __LINE__);
+                           }
+                       }//end if circ error
+                   }//end if put in write file
 
-                  if(newClientState == ST_CONNECT || newClientState == ST_WRITING ) {
+                   // Client juste finished to work, delete it
+                   else if (newClientState == ST_ENDED) {
 
-                     //put in write (or connect if 3 threads) queue
-                     if (put_circ(toWriteBuffer, client) == CIRC_BUF_ERROR) {
-						 if (open_active) {
-							 PANIC("put_circ l.%d error, consider raising circular buffer size\n", __LINE__);
-						 }
-						 else {
-							 PANIC("put_circ l.%d error. should be impossible\n", __LINE__);
-						 }
-                     }//end if circ error
+                       assert(open_active == 1);
 
-                  }//end if put in write file
+                       // Potential concurrency problem?
+                       if (client->prev != NULL) {
+                           client->prev->next = client->next;
+                           if (client->next != NULL) {
+                               client->next->prev = client->prev;
+                           }
+                       }
+                       else {
+                           all_clients = client->next;
+                           if (client->next != NULL) {
+                               client->next->prev = NULL;
+                           }
+                       }
+                       close(client->fd);
 
-				  // Client juste finished to work, delete it
-				  else if (newClientState == ST_ENDED) {
+                       //Needed for calculating throughput
+                       global_total_bytes_recv += client->total_bytes_recv;
+                       global_total_resp_recv += client->total_resp_recv;
 
-					  assert(open_active == 1);
+                       // Compute errors
+                       global_errors += client->errors;
 
-					  // Potential concurrency problem?
-					  if (prev != NULL) {
-						  prev->next = client->next;
-					  }
-					  else {
-						  all_clients = client->next;
-					  }
-					  close(client->fd);
-
-					  //Needed for calculating throughput
-					  global_total_bytes_recv += client->total_bytes_recv;
-					  global_total_resp_recv += client->total_resp_recv;
-
-					  // Compute errors
-					  global_errors += client->errors;
-
-					  DEBUG("Client %d just finished.\n", client->number);
-
-					  client_t * next = client->next;
-					  next_client = 0;
-					  free(client);
-					  client = next;
-				  }
+                       DEBUG("Client %d just finished.\n", client->number);
+                       free(client);
+                   }
 
                }//end if changed state
 
-            }// end if fd_isset
+           }//end if do_read
 
-         }//end if do_read
+       }//end for
 
-		 if (next_client) {
-			 prev = client;
-			 client = client->next;
-		 }
-      }//end for
+       rdtscll(current_time_cycles);
 
-      rdtscll(current_time_cycles);
+       // Create new requests based on rdtscll difference
+       if (open_active) {
+           while (current_time_cycles > next_request_cycles) {
+               // Create a new client for a new request
+               // Concurrency issue?
+               client_t *new_client = (client_t *)calloc(1, sizeof(client_t));
+               assert(new_client != NULL);
 
-	  // Create new requests based on rdtscll difference
-	  if (open_active) {
-		  while (current_time_cycles > next_request_cycles) {
-			  // Create a new client for a new request
-			  // Concurrency issue?
-			  client_t *new_client = (client_t *)calloc(1, sizeof(client_t));
-			  assert(new_client != NULL);
-
-			  new_client->number = client_counter++;
-			  new_client->fd = -1;
-			  DEBUG("New client %d created at %s\n", client_counter - 1, getCurrentTime());
-			  new_client->state = ST_CONNECT;
-			  new_client->new_request = 1;
+               new_client->number = client_counter++;
+               new_client->fd = -1;
+               DEBUG("New client %d created at %s\n", client_counter - 1, getCurrentTime());
+               new_client->state = ST_CONNECT;
+               new_client->new_request = 1;
 
 #if !MULTIPLE_INTERFACES
-			  init_server_target(new_client, host, port);
+               init_server_target(new_client, host, port);
 #endif
-			  // Put into circular buffer for next time
-			  put_circ(toWriteBuffer, new_client);
-			  new_client->next = all_clients;
-			  all_clients = new_client;
+               // Put into circular buffer for next time
+               put_circ(toWriteBuffer, new_client);
 
-			  // Compute time to next request
-			  double next_seconds = 1.f / gaussrand(open_mean, open_var);
-			  DEBUG("Next in %f\n", next_seconds);
-			  next_request_cycles += (next_seconds * (double)proc_freq);
-		  }
-	  }
+               // Insert in head into doubly linked list
+               if (all_clients != NULL) {
+                   all_clients->prev = new_client;
+               }
+               new_client->next = all_clients;
+               new_client->prev = NULL;
+
+               // Replace head of client list
+               all_clients = new_client;
+
+               // Compute time to next request
+               double next_seconds = 1.f / gaussrand(open_mean, open_var);
+               DEBUG("Next in %f\n", next_seconds);
+               next_request_cycles += (next_seconds * (double)proc_freq);
+           }
+       }
 
    } while((current_time_cycles - start_time_cycles) < duration); //end while
 
+   close(master_read_epl);
    pthread_exit(NULL);
 }
 
@@ -2590,7 +2567,8 @@ int main(int argc, char** argv) {
       memset(interfaces_pending, 0, sizeof(int)*NB_ITFS);
 #endif
 
-      FD_ZERO(&master_connect_fds);
+      master_connect_epl = epoll_create(MAX_CLIENTS);
+      assert(master_connect_epl != -1);
 
       //Create circular buffers.
       toReadBuffer = malloc(sizeof(circularBuffer));
