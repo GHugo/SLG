@@ -715,13 +715,17 @@ states_t initialize_connect_client_to_server(client_t* client) {
    int status = connect(client->fd, (struct sockaddr *)&(client->soc_address), client->is_unix ? sizeof(struct sockaddr_un) : sizeof(struct sockaddr_in));
 
    int err= errno;
-   if ((status == -1) && (err != EINPROGRESS && err != EADDRNOTAVAIL && err != ECONNABORTED)) {
+   if ((status == -1) && (err != EINPROGRESS && err != EADDRNOTAVAIL && err != ECONNABORTED && err != EAGAIN)) {
       PRINT_ALERT("Client %d get an error for its connect. errno is %d (%s), status = %d\n",
                client->number, err, strerror(err), status);
       exit(EXIT_FAILURE);
    }
-   else if (err == EADDRNOTAVAIL) {
-      PRINT_ALERT("No more free local port. Will try later\n");
+   else if (err == EADDRNOTAVAIL || err == EAGAIN) {
+	  // In open loop, avoid flooding
+	  if (!open_active) {
+		  PRINT_ALERT("No more free local port. Will try later\n");
+	  }
+
 	  // On open-loop set the client to close to avoid spawning too much clients
       return open_active ? ST_ENDED : ST_CONNECT;
    }
@@ -741,9 +745,6 @@ states_t initialize_connect_client_to_server(client_t* client) {
 
       // Connect OK
       add_client_to_master_write_set(client);
-
-      // Updating client info
-      change_state(client, ST_WRITING);
 
       return ST_WRITING;
 
@@ -1443,7 +1444,7 @@ static void read_headers(client_t *client){
             PANIC("Received a SIGPIPE on socket %d\n",client->fd);
          default:
             perror("Read Error");
-            PANIC("Unwanted read error on socket %d\n", client->fd);
+            PANIC("Unwanted read error on socket %d for %d\n", client->fd, client->number);
       }
    }
    else if (status == 0) {
@@ -1854,6 +1855,38 @@ void print_stats() {
 }
 
 /**
+ * Close a client
+ **/
+static void delete_client(client_t *client) {
+	assert(open_active == 1);
+
+	// Potential concurrency problem?
+	if (client->prev != NULL) {
+		client->prev->next = client->next;
+		if (client->next != NULL) {
+			client->next->prev = client->prev;
+		}
+	}
+	else {
+		all_clients = client->next;
+		if (client->next != NULL) {
+			client->next->prev = NULL;
+		}
+	}
+	DEBUG("Closing socket %d for client %d after state ST_ENDED.\n", client->number, client->fd);
+	close(client->fd);
+
+	//Needed for calculating throughput
+	global_total_bytes_recv += client->total_bytes_recv;
+	global_total_resp_recv += client->total_resp_recv;
+
+	// Compute errors
+	global_errors += client->errors;
+
+	DEBUG("Client %d just finished.\n", client->number);
+	free(client);
+}
+/**
  * Writing thread
  * Function used to inject load on the server.
  */
@@ -1895,7 +1928,16 @@ static void *writingFunc() {
                   if (client->state == ST_CONNECT) {//CONNECTING
                       if (!client->connect_in_progress) {
                           //We have to connect because it is the first time we connect for the loop or we had an error before
-                          initialize_connect_client_to_server(client);
+                          states_t newState = initialize_connect_client_to_server(client);
+
+						  // Updating client info
+						  if (client->state != newState) {
+							  change_state(client, newState);
+
+							  if (newState == ST_ENDED) {
+								  delete_client(client);
+							  }
+						  }
                       }
                   }
               }
@@ -2065,15 +2107,10 @@ static void *readingFunc() {
            if ((events[i].events & EPOLLERR) ||
                (events[i].events & EPOLLHUP) ||
                (!(events[i].events & EPOLLIN))) {
-               int error = 0;
-               socklen_t errlen = sizeof(error);
-               if (getsockopt(client->fd, SOL_SOCKET, SO_ERROR, (void *)&error, &errlen) == 0) {
-                   PANIC("Receiving error while reading, error %s for client %d.\n", strerror(error), client->number);
-               }
-               PANIC("Receiving error while reading, unkown error for client %d.\n", client->number);
+               treat_error(client);
            }
            //Do read only if we need it.
-           if(client->internalReadStatus == DO_READ && events[i].events & EPOLLIN) {
+           else if(client->internalReadStatus == DO_READ && events[i].events & EPOLLIN) {
                //read response
                newClientState = read_response(client);
 
@@ -2082,11 +2119,6 @@ static void *readingFunc() {
 
                    client->internalReadStatus = DO_NOTHING;
                    // No need to remove from this pool, the socket was closed in read_response (and thus remove).
-                   /*
-                     if (epoll_ctl(master_read_epl, EPOLL_CTL_DEL, fd, NULL) != 0) {
-                         PANIC("Error while remove from read set fd = %d, client = %d, error = %s.\n", fd, client->number, strerror(errno));
-                     }*/
-
                    if(newClientState == ST_CONNECT || newClientState == ST_WRITING ) {
                        //put in write (or connect if 3 threads) queue
                        if (put_circ(toWriteBuffer, client) == CIRC_BUF_ERROR) {
@@ -2101,33 +2133,7 @@ static void *readingFunc() {
 
                    // Client juste finished to work, delete it
                    else if (newClientState == ST_ENDED) {
-
-                       assert(open_active == 1);
-
-                       // Potential concurrency problem?
-                       if (client->prev != NULL) {
-                           client->prev->next = client->next;
-                           if (client->next != NULL) {
-                               client->next->prev = client->prev;
-                           }
-                       }
-                       else {
-                           all_clients = client->next;
-                           if (client->next != NULL) {
-                               client->next->prev = NULL;
-                           }
-                       }
-                       close(client->fd);
-
-                       //Needed for calculating throughput
-                       global_total_bytes_recv += client->total_bytes_recv;
-                       global_total_resp_recv += client->total_resp_recv;
-
-                       // Compute errors
-                       global_errors += client->errors;
-
-                       DEBUG("Client %d just finished.\n", client->number);
-                       free(client);
+					   delete_client(client);
                    }
 
                }//end if changed state
@@ -2163,6 +2169,7 @@ static void *readingFunc() {
                    all_clients->prev = new_client;
                }
                new_client->next = all_clients;
+			   assert(new_client != new_client->next);
                new_client->prev = NULL;
 
                // Replace head of client list
