@@ -954,20 +954,24 @@ char * choose_url(__attribute__((unused)) client_t* client) {
 
 #elif SPECWEB09_BANKING_WORKLOAD
    double d = (double) rand () / ((double)RAND_MAX+1.);
-   float sum = page_transitions[client->current_url][0];
+   float sum = open_active ? vector_transitions[0] : page_transitions[client->current_url][0];
    int url_size = 128;
 
    int i = 1;
 
-   if (open_active) {
-	   PANIC("Need to implement Banking Workload for open-loop (compute Markov Steady-State.\n");
+   while (i < SPECWEB09_BANKING_WORKLOAD_PAGE_COUNT && sum <= d) {
+       // In open-loop, use steady state vector
+       if (open_active) {
+           sum += vector_transitions[i++];
+       }
+       // In close-loop, use markov transition table
+       else {
+           sum += page_transitions[client->current_url][i++];
+       }
    }
 
-   while (i < SPECWEB09_BANKING_WORKLOAD_PAGE_COUNT && sum <= d)
-	   sum += page_transitions[client->current_url][i++];
-
    if (i == SPECWEB09_BANKING_WORKLOAD_PAGE_COUNT && sum <= d)
-	   PANIC("Seeking URL for SpecWeb09 banking and goes out. Check probabilities -- or algorithm\n");
+       PANIC("Seeking URL for SpecWeb09 banking and goes out. Check probabilities -- or algorithm\n");
 
    url = calloc(url_size, sizeof(char));
    strncpy(url, page_mapping[i - 1], url_size - 1);
@@ -1079,12 +1083,14 @@ void build_fastcgi_request(client_t* client) {
 	   fastcgi_absolute_url = calloc(base_path_length + (token - url) + 1, sizeof(char));
 	   strcpy(fastcgi_absolute_url, fastcgi_base_path);
 	   strncat(fastcgi_absolute_url, url, token - url);
+       fastcgi_absolute_url[base_path_length + (token - url)] = '\0';
 
-	   script_name = calloc(token - url, sizeof(char));
-	   strcpy(script_name, url);
+	   script_name = calloc(token - url + 1, sizeof(char));
+	   strncpy(script_name, url, token - url);
+       script_name[token - url] = '\0';
 
-	   query_string = calloc(url_length - (url - token - 1) + 1, sizeof(char));
-	   strcat(query_string, (char *)(url - token + 1));
+	   query_string = calloc(url_length - (token - url + 1) + 1, sizeof(char));
+	   strcat(query_string, (char *)(token + 1));
    }
 
    const char *params[] = {

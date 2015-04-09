@@ -397,7 +397,7 @@ void parse_command_line(int argc, char** argv) {
             break;
 
          case 'o':
-            open_active = atoi(optarg);
+            open_active = 1;
 			break;
 
          case OPT_OPEN_MEAN:
